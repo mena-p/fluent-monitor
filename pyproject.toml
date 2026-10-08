@@ -1,0 +1,24 @@
+[project]
+name = "fluent-monitor"
+version = "1.0.0"
+description = "Live plots of Ansys Fluent report files (.out) without the Fluent GUI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+]
+
+[project.scripts]
+fluent-monitor = "fluent_monitor.app:run"
+
+# Same program without a console window (Windows); used by the .bat launcher-free shortcut
+[project.gui-scripts]
+fluent-monitor-gui = "fluent_monitor.app:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fluent_monitor"]
