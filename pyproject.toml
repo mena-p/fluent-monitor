@@ -1,18 +1,20 @@
 [project]
 name = "fluent-monitor"
-version = "1.0.0"
+version = "2.2.0"
 description = "Live plots of Ansys Fluent report files (.out) without the Fluent GUI"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "matplotlib>=3.8",
+    "pyqtgraph>=0.13.7",
+    "PySide6-Essentials>=6.7",
     "numpy>=1.26",
 ]
 
 [project.scripts]
 fluent-monitor = "fluent_monitor.app:run"
+fluent-monitor-web = "fluent_monitor.web:run"
 
-# Same program without a console window (Windows); used by the .bat launcher-free shortcut
+# Same program without a console window (Windows), for `uv tool install .`
 [project.gui-scripts]
 fluent-monitor-gui = "fluent_monitor.app:run"
 

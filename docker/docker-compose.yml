@@ -1,0 +1,41 @@
+# fluent-monitor-web behind an eduVPN WireGuard tunnel (e.g. on Unraid).
+# Setup: see README.md in this folder. Start/update with:  docker compose up -d --build
+name: fluent-monitor
+
+services:
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: fluent-wireguard
+    cap_add:
+      - NET_ADMIN            # SYS_MODULE is not needed: Unraid's kernel has WireGuard built in
+    environment:
+      - PUID=99              # Unraid's nobody:users
+      - PGID=100
+      - TZ=${TZ:-Europe/Berlin}
+    volumes:
+      - ./wireguard:/config  # your eduVPN file goes to ./wireguard/wg_confs/wg0.conf
+    ports:
+      - ${FM_PORT:-8050}:8050   # the monitor shares this container's network, so its port is published here
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv6.conf.all.disable_ipv6=0
+    restart: unless-stopped
+
+  fluent-monitor:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: fluent-monitor-web:local
+    container_name: fluent-monitor
+    init: true                        # passes Ctrl+C / docker stop on, so it stops at once
+    network_mode: service:wireguard   # all its traffic goes through the tunnel
+    depends_on:
+      wireguard:
+        condition: service_started
+        restart: true                 # restart together with the tunnel (it loses its network otherwise)
+    env_file: .env                    # FLUENT_FOLDER, SMB_USERNAME, SMB_PASSWORD, ...
+    environment:
+      - TZ=${TZ:-Europe/Berlin}
+    volumes:
+      - ./data:/data                  # access token + combined plots survive updates
+    restart: unless-stopped

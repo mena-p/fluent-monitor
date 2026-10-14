@@ -1,0 +1,5 @@
+.venv
+dist
+docker
+**/__pycache__
+*.bat

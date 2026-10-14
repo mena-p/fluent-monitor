@@ -1,0 +1,1 @@
+Put your eduVPN WireGuard file here as wg0.conf (see ../../README.md).

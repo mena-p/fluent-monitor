@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<title>Fluent monitor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M1 13 L5 6 L8 9 L15 2' fill='none' stroke='%231f77b4' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/uPlot.min.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="top">
+  <button id="btn-menu" class="icon-btn" aria-label="Report files" title="Report files">&#9776;</button>
+  <div class="brand">
+    <span class="app-name">Fluent monitor</span>
+    <span id="folder" class="folder"></span>
+  </div>
+  <div id="conn" class="conn" title="Connection to the server"><span class="dot"></span><span id="conn-text">connecting…</span></div>
+  <div class="seg" role="group" aria-label="View">
+    <button id="btn-tabs" class="seg-btn">Tabs</button>
+    <button id="btn-grid" class="seg-btn">Grid</button>
+  </div>
+</header>
+
+<div id="layout">
+  <aside id="side" aria-label="Report files">
+    <div class="side-head">
+      <span>Report files</span>
+      <button id="btn-close-side" class="icon-btn only-narrow" aria-label="Close">&times;</button>
+    </div>
+    <ul id="file-list" class="checklist"></ul>
+    <div id="group-head" class="side-sub" hidden>Combined plots</div>
+    <ul id="group-list" class="checklist"></ul>
+    <div class="side-buttons">
+      <button id="btn-all">All</button>
+      <button id="btn-none">None</button>
+      <button id="btn-combine" title="Combine the ticked report files into one plot">Combine…</button>
+    </div>
+    <div class="side-opts">
+      <label>Grid columns
+        <select id="sel-cols">
+          <option value="auto">auto</option><option>1</option><option>2</option><option>3</option><option>4</option>
+        </select>
+      </label>
+      <label>Refresh
+        <select id="sel-refresh">
+          <option value="1">1 s</option><option value="2" selected>2 s</option><option value="5">5 s</option>
+          <option value="10">10 s</option><option value="30">30 s</option>
+        </select>
+      </label>
+    </div>
+    <p class="hint only-wide">Wheel: zoom (Shift: y only, Ctrl: x only) · drag: zoom box · double-click: reset</p>
+    <p class="hint only-touch">Two fingers: zoom / pan · tap: value · double-tap: reset</p>
+  </aside>
+  <div id="scrim"></div>
+
+  <main id="main">
+    <nav id="tabbar" hidden></nav>
+    <div id="plots"></div>
+    <div id="placeholder">
+      <p>Tick report files to plot them.</p>
+      <button id="btn-open-files" class="only-narrow">Choose files</button>
+    </div>
+  </main>
+</div>
+
+<script src="/static/uPlot.iife.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
