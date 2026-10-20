@@ -1,22 +1,17 @@
 [project]
 name = "fluent-monitor"
-version = "2.2.0"
-description = "Live plots of Ansys Fluent report files (.out) without the Fluent GUI"
+version = "3.0.0"
+description = "Live plots of Ansys Fluent report files, residuals and solver messages in the browser"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "pyqtgraph>=0.13.7",
-    "PySide6-Essentials>=6.7",
     "numpy>=1.26",
+    "smbprotocol>=1.14",   # reads smb://server/share folders directly (Docker on Unraid)
 ]
 
 [project.scripts]
-fluent-monitor = "fluent_monitor.app:run"
-fluent-monitor-web = "fluent_monitor.web:run"
-
-# Same program without a console window (Windows), for `uv tool install .`
-[project.gui-scripts]
-fluent-monitor-gui = "fluent_monitor.app:run"
+fluent-monitor = "fluent_monitor.web:run"
+fluent-monitor-web = "fluent_monitor.web:run"   # old name, same program
 
 [build-system]
 requires = ["hatchling"]

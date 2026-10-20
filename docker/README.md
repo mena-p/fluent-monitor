@@ -1,9 +1,9 @@
-# fluent-monitor-web in Docker, behind the eduVPN tunnel (Unraid)
+# fluent-monitor in Docker, behind the eduVPN tunnel (Unraid)
 
 Two containers:
 
 - **wireguard** (linuxserver/wireguard): connects to eduVPN with your WireGuard file.
-- **fluent-monitor**: the web server (no Qt, about 110 MB). It uses the wireguard
+- **fluent-monitor**: the same monitor you run on your laptop (about 110 MB). It uses the wireguard
   container's network, so everything it does goes through the tunnel. It reads the report
   files straight from the university's SMB share (Windows file share). No mounting is
   needed on Unraid and no extra privileges in the container.
@@ -60,11 +60,14 @@ chmod 600 .env
 nano .env
 ```
 
-- `FLUENT_FOLDER`: the case folder as an SMB path: `smb://server/share/sub/folder`.
+- `FLUENT_FOLDER`: the case folder to start with, as an SMB path: `smb://server/share/sub/folder`.
   On Windows, run `net use` in cmd to see which `\\server\share` is behind your drive
   letter. `Z:\Semesterarbeit\Fluent` on `\\fs01.uni.example\home$\pedro` becomes
   `smb://fs01.uni.example/home$/pedro/Semesterarbeit/Fluent`.
   If the name doesn't resolve over the VPN, use the server's IP address instead.
+- `FM_ROOT` (optional): the web page can switch to any folder below this one. Empty means
+  the whole share; set it to e.g. `smb://fs01.uni.example/home$/pedro/Semesterarbeit` to
+  show only your own folders.
 - `SMB_USERNAME`, `SMB_PASSWORD`, `SMB_DOMAIN`: the account you use for that share,
   normally your university login. The files are only read, never changed.
 - `FM_PUBLIC_URL`: how you open Unraid from the phone, e.g. `http://tower:8050` or its
@@ -91,7 +94,12 @@ Check the tunnel with `docker compose logs wireguard`. It should end without err
   shows "report folder not reachable (VPN down?)" and keeps the data it already has.
 - **After changing the code:** `docker compose up -d --build`.
 - **Stop:** `docker compose down`.
-- **Another case folder:** change `FLUENT_FOLDER` in `.env`, then `docker compose up -d`.
+- **Another case folder:** in the web page, open ☰ → *Change folder…* (or click the folder
+  name at the top), browse to the case and press *Watch this folder*. Every open browser
+  switches along. The choice survives restarts. The folder dialog also lists recently
+  used folders, and selections and combined plots are remembered per folder.
+  Editing `FLUENT_FOLDER` in `.env` still works: a changed value wins once at the next
+  `docker compose up -d`.
 
 ## Troubleshooting
 

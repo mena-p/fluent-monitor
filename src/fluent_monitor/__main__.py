@@ -1,4 +1,3 @@
-from fluent_monitor.app import run
+from fluent_monitor.web import run
 
-if __name__ == "__main__":
-    run()
+run()

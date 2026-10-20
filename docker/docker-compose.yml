@@ -1,4 +1,4 @@
-# fluent-monitor-web behind an eduVPN WireGuard tunnel (e.g. on Unraid).
+# fluent-monitor behind an eduVPN WireGuard tunnel (e.g. on Unraid).
 # Setup: see README.md in this folder. Start/update with:  docker compose up -d --build
 name: fluent-monitor
 
@@ -25,7 +25,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: fluent-monitor-web:local
+    image: fluent-monitor:local
     container_name: fluent-monitor
     init: true                        # passes Ctrl+C / docker stop on, so it stops at once
     network_mode: service:wireguard   # all its traffic goes through the tunnel

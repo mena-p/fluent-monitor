@@ -74,6 +74,18 @@ class SMBFS:
     def listdir(self, folder):
         return self._call(self._smb.listdir, self._unc(folder), **self._kw)
 
+    def scandir(self, folder):
+        """[(name, is_dir), ...] in one round trip (the directory listing carries the attributes)."""
+        def scan():
+            return [(e.name, e.is_dir()) for e in self._smb.scandir(self._unc(folder), **self._kw)]
+        return self._call(scan)
+
+    @staticmethod
+    def root(path):
+        """'//server/share/a/b' -> '//server/share'."""
+        parts = normalize(path)[2:].split("/")
+        return "//" + "/".join(parts[:2])
+
     def isdir(self, folder):
         try:
             return self._call(self._smb.path.isdir, self._unc(folder), **self._kw)

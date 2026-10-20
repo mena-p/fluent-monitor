@@ -1,5 +1,5 @@
 """Shared, GUI-independent parts of fluent-monitor: reading Fluent report files, the data
-store, combined-plot settings. Used by the desktop app (app.py) and the web server (web.py)."""
+store, settings (combined plots, access token, folders). Used by the server (web.py)."""
 
 import json
 import os
@@ -39,12 +39,44 @@ def short_label(name):
 
 
 # --------------------------------------------------------------------------- data
+class LocalFS:
+    """File access on this computer (the default). smbfs.SMBFS offers the same API over SMB."""
+
+    join = staticmethod(os.path.join)
+    listdir = staticmethod(os.listdir)
+
+    @staticmethod
+    def scandir(folder):
+        """[(name, is_dir), ...] of a folder."""
+        out = []
+        with os.scandir(folder) as it:
+            for e in it:
+                try:
+                    out.append((e.name, e.is_dir()))
+                except OSError:
+                    pass
+        return out
+
+    isdir = staticmethod(os.path.isdir)
+    getsize = staticmethod(os.path.getsize)
+
+    @staticmethod
+    def read_range(path, offset, n):
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            return fh.read(n)
+
+
+LOCAL_FS = LocalFS()
+
+
 class FileReader:
     """Reads what was appended to a report file since the last call and parses it.
     Used only in the background poller thread, so slow disk access never blocks the window."""
 
-    def __init__(self, path):
+    def __init__(self, path, fs=LOCAL_FS):
         self.path = path
+        self.fs = fs
         self.offset = 0
         self.partial = b""
         self.ncols = 0
@@ -52,7 +84,7 @@ class FileReader:
     def read(self):
         """List of events since the last call: ("reset",), ("columns", names), ("rows", array)."""
         try:
-            size = os.path.getsize(self.path)
+            size = self.fs.getsize(self.path)
         except OSError:
             return []
         events = []
@@ -62,9 +94,7 @@ class FileReader:
         if size == self.offset:
             return events
         try:
-            with open(self.path, "rb") as fh:
-                fh.seek(self.offset)
-                chunk = fh.read(size - self.offset)
+            chunk = self.fs.read_range(self.path, self.offset, size - self.offset)
         except OSError:                       # file locked for a moment on Windows
             return events
         self.offset += len(chunk)
@@ -89,6 +119,9 @@ class FileReader:
                     events.append(("columns", names))
                 continue
             if line.startswith('"'):          # file title / short header
+                names = QUOTED.findall(line)
+                if len(names) > 1:            # "Iteration" "mach": the report definitions in the file
+                    events.append(("defs", [n for n in names if not is_counter(n)]))
                 continue
             parts = line.split()
             if not self.ncols:                # headerless file: invent names
@@ -112,6 +145,7 @@ class ReportFile:
         self.name = os.path.basename(path)
         self.title = os.path.splitext(self.name)[0]
         self.layout_version = 0    # bumps when the column set changes
+        self.defs = []             # names of the report definitions written to this file
         self.rewinds = 0           # bumps when stored rows were replaced (iteration counter went back)
         self._reset()
 
@@ -126,6 +160,18 @@ class ReportFile:
             self.columns = names
             self.buf = np.empty((len(names), 1024))
             self.n = 0
+            self.layout_version += 1
+
+    def ensure_columns(self, names):
+        """Add the columns of `names` that are missing; stored data stays, new columns are NaN."""
+        if not self.columns:
+            self._set_columns(list(names))
+            return
+        new = [n for n in names if n not in self.columns]
+        if new:
+            buf = np.full((len(self.columns) + len(new), self.buf.shape[1]), np.nan)
+            buf[:len(self.columns)] = self.buf
+            self.buf, self.columns = buf, self.columns + new
             self.layout_version += 1
 
     def col(self, i):
@@ -170,6 +216,8 @@ class ReportFile:
                 changed = True
             elif ev[0] == "rows":
                 changed = self._add_rows(ev[1]) or changed
+            elif ev[0] == "defs":
+                self.defs = ev[1]
         if changed:
             self.last_change = time.time()
         return changed
@@ -207,12 +255,13 @@ def get_web_token(renew=False):
     """Access token of the web server, created once and kept in the settings file
     (so a bookmarked link keeps working across restarts)."""
     import secrets
-    d = _load_settings()
-    tok = d.get("web_token")
-    if renew or not tok:
-        tok = secrets.token_urlsafe(16)
-        d["web_token"] = tok
-        _save_settings(d)
+    with _settings_lock:
+        d = _load_settings()
+        tok = d.get("web_token")
+        if renew or not tok:
+            tok = secrets.token_urlsafe(16)
+            d["web_token"] = tok
+            _save_settings(d)
     return tok
 
 
@@ -223,6 +272,9 @@ def _load_settings():
             return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+_settings_lock = threading.RLock()   # the web server saves from several threads
 
 
 def _save_settings(d):
@@ -259,11 +311,38 @@ def load_groups(folder):
     return {str(k): [str(f) for f in v] for k, v in g.items() if isinstance(v, list)}
 
 
-def save_groups(folder, groups):
+def load_web_folder():
+    """Folder last chosen in the web app, and the recently used ones (newest first)."""
     d = _load_settings()
-    all_groups = d.setdefault("groups", {})
-    if groups:
-        all_groups[_folder_key(folder)] = groups
-    else:
-        all_groups.pop(_folder_key(folder), None)
-    _save_settings(d)
+    recent = [str(f) for f in d.get("web_recent", []) if isinstance(f, str)]
+    return d.get("web_folder"), recent
+
+
+def save_web_folder(folder, keep=10):
+    with _settings_lock:
+        d = _load_settings()
+        d["web_folder"] = folder
+        d["web_recent"] = ([folder] + [f for f in d.get("web_recent", []) if f != folder])[:keep]
+        _save_settings(d)
+
+
+def get_setting(key, default=None):
+    return _load_settings().get(key, default)
+
+
+def set_setting(key, value):
+    with _settings_lock:
+        d = _load_settings()
+        d[key] = value
+        _save_settings(d)
+
+
+def save_groups(folder, groups):
+    with _settings_lock:
+        d = _load_settings()
+        all_groups = d.setdefault("groups", {})
+        if groups:
+            all_groups[_folder_key(folder)] = groups
+        else:
+            all_groups.pop(_folder_key(folder), None)
+        _save_settings(d)

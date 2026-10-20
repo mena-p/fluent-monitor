@@ -1,12 +1,13 @@
 """
-fluent-monitor-web - serve live plots of Fluent report files to any browser (desktop or phone).
+fluent-monitor - live plots of Ansys Fluent report files, residuals and solver messages in the browser.
 
-    uv run fluent-monitor-web "C:/path/to/case"            # serves on port 8050
-    uv run fluent-monitor-web "C:/path/to/case" --port 9000
+    uv run fluent-monitor                          # last folder; opens the page in your browser
+    uv run fluent-monitor "C:/path/to/case"        # that folder
+    uv run fluent-monitor --lan                    # also reachable from other devices (phone)
 
-Open the printed link (it contains an access token) in a browser. The server reads the report
-files in a background thread and sends browsers only the rows they don't have yet.
-Only Python's standard library + numpy are used here (no Qt).
+A small web server: it reads the report files and Fluent's transcript in a background thread and
+sends browsers only the rows they don't have yet. Python's standard library + numpy (+ smbprotocol
+for smb:// folders). The same program runs in Docker (see docker/README.md).
 """
 
 import argparse
@@ -19,12 +20,18 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.error
+import urllib.request
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
-from .core import (DebugLog, FileReader, ReportFile, get_web_token, load_groups, load_last_folder,
-                   save_groups, save_last_folder)
+from .core import (LOCAL_FS, _folder_key, DebugLog, FileReader, ReportFile, get_web_token, load_groups,
+                   get_setting, load_last_folder, load_web_folder, save_groups, save_last_folder,
+                   save_web_folder, set_setting)
+from .smbfs import is_smb_path, normalize
+from .transcript import TranscriptSource
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_static")
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
@@ -38,8 +45,9 @@ class Monitor:
 
     SCAN_EVERY = 5.0
 
-    def __init__(self, folder, pattern, interval, log=None):
+    def __init__(self, folder, pattern, interval, log=None, fs=LOCAL_FS):
         self.folder = folder
+        self.fs = fs
         self.pattern = pattern
         self.interval = interval
         self.log = log
@@ -51,37 +59,94 @@ class Monitor:
         self.groups_version = 0
         self.last_read = None    # time of the last completed read pass
         self._last_scan = 0.0
+        self.list_error = None
+        self.epoch = 1           # +1 whenever the folder changes; browsers drop data of older epochs
+        self.trn = TranscriptSource(folder, fs)   # residuals + solver messages from *.trn
+        self.virtual = []        # names of the transcript data sets ("Residuals", ...)
+        self.ack = self._load_ack(folder)
         self._wake = threading.Event()
         threading.Thread(target=self._run, name="report-reader", daemon=True).start()
 
+    def set_folder(self, folder):
+        """Watch another folder from now on (the reader thread starts over)."""
+        groups = load_groups(folder)
+        with self.lock:
+            self.folder = folder
+            self.files, self.readers, self.listing = {}, {}, []
+            self.trn = TranscriptSource(folder, self.fs)
+            self.virtual = []
+            self.ack = self._load_ack(folder)
+            self.groups = groups
+            self.list_error = None
+            self.last_read = None
+            self._last_scan = 0.0
+            self.epoch += 1
+        self._wake.set()
+        print(f"now watching {folder}", flush=True)
+
     def _run(self):
         while True:
+            with self.lock:
+                epoch, folder = self.epoch, self.folder
             now = time.time()
             if now - self._last_scan >= self.SCAN_EVERY or not self.listing:
                 self._last_scan = now
+                error = None
                 try:
-                    listing = sorted(f for f in os.listdir(self.folder)
-                                     if fnmatch.fnmatch(f.lower(), self.pattern.lower()))
-                except OSError:
-                    listing = []
+                    names = self.fs.listdir(folder)
+                    listing = sorted(f for f in names if fnmatch.fnmatch(f.lower(), self.pattern.lower()))
+                except OSError as e:          # e.g. VPN down: keep the data we have, retry later
+                    error, listing, names = str(e), None, None
                 with self.lock:
-                    self.listing = listing
-                    for name in listing:
-                        if name not in self.files:
-                            self.files[name] = ReportFile(os.path.join(self.folder, name))
-                            self.readers[name] = FileReader(os.path.join(self.folder, name))
-            for name in list(self.listing):
-                reader = self.readers.get(name)
-                if reader is None:
-                    continue
+                    if epoch != self.epoch:   # folder changed meanwhile
+                        continue
+                    if error:
+                        if error != self.list_error:
+                            print(f"cannot list {folder}: {error}  (retrying)", flush=True)
+                        self.list_error = error
+                    else:
+                        if self.list_error:
+                            print(f"folder reachable again ({len(listing)} report files)", flush=True)
+                        self.list_error = None
+                        self.listing = listing
+                        self.trn.update_listing(names)
+                        for name in listing:
+                            if name not in self.files:
+                                path = self.fs.join(folder, name)
+                                self.files[name] = ReportFile(path)
+                                self.readers[name] = FileReader(path, self.fs)
+            with self.lock:
+                todo = [] if self.list_error or epoch != self.epoch else \
+                    [(n, self.readers[n], self.files[n]) for n in self.listing if n in self.readers]
+            for name, reader, rf in todo:
                 t0 = time.perf_counter()
                 events = reader.read()                    # file access outside the lock
                 if self.log:
                     self.log.slow(f"reading {name}", t0, 0.05)
                 if events:
                     with self.lock:
-                        self.files[name].apply(events)
-            self.last_read = time.time()
+                        if epoch != self.epoch:
+                            break
+                        rf.apply(events)
+            with self.lock:
+                trn = self.trn if epoch == self.epoch and not self.list_error else None
+            if trn is not None:
+                with self.lock:          # report definitions of the folder: not residuals
+                    trn.report_names = {d.lower() for n in self.listing if n in self.files
+                                        for d in self.files[n].defs}
+                t0 = time.perf_counter()
+                results = trn.read()                       # transcripts: residuals + messages
+                if self.log:
+                    self.log.slow("reading transcripts", t0, 0.05)
+                with self.lock:
+                    if epoch == self.epoch and results:
+                        trn.apply(results)
+                        sets = trn.datasets()
+                        self.virtual = [n for n, _ in sets]
+                        self.files.update(sets)
+            with self.lock:
+                if epoch == self.epoch:
+                    self.last_read = time.time()
             self._wake.wait(self.interval)
             self._wake.clear()
 
@@ -92,14 +157,54 @@ class Monitor:
     def status(self):
         with self.lock:
             files = []
-            for name in self.listing:
+            for name in self.virtual + self.listing:
                 rf = self.files.get(name)
                 if rf is None:
                     continue
                 files.append({"name": name, "v": self._version(rf), "n": rf.n, "columns": rf.columns,
-                              "last_change": rf.last_change})
-            return {"folder": self.folder, "files": files, "groups": self.groups,
-                    "server_time": time.time(), "last_read": self.last_read, "interval": self.interval}
+                              "last_change": rf.last_change,
+                              "kind": "transcript" if name in self.virtual else "report"})
+            return {"folder": self.folder, "epoch": self.epoch, "files": files, "groups": self.groups,
+                    "server_time": time.time(), "last_read": self.last_read, "interval": self.interval,
+                    "error": self.list_error, "solver": self._solver()}
+
+    # ---- solver health from the transcript
+    IDLE_AFTER = 300.0
+
+    def _solver(self):
+        """Called with the lock held."""
+        t = self.trn
+        if not t.current:
+            return {"state": "none"}
+        snap = t.alerts.snapshot(t.current, t.last_iter, self.ack)
+        age = time.time() - t.last_row_time if t.last_row_time else None
+        conv = next((g for g in snap["current"] if g["cat"] == "converged"), None)
+        if snap["level"] != "ok":
+            state = snap["level"]
+        elif t.closed:
+            state = "closed"                      # "Auto-Transcript Stop Time": Fluent was closed
+        elif conv and conv["ago"] is not None and conv["ago"] <= 1:
+            state = "converged"
+        elif age is None or age > self.IDLE_AFTER:
+            state = "idle"
+        else:
+            state = "running"
+        snap.update(state=state, iteration=t.last_iter, age=age)
+        return snap
+
+    def acknowledge(self):
+        with self.lock:
+            pos = self.trn.alerts.last_position()
+            if pos:
+                self.ack = pos
+            folder, ack = self.folder, self.ack
+        acks = get_setting("alert_ack", {}) or {}
+        acks[_folder_key(folder)] = ack
+        set_setting("alert_ack", acks)
+
+    @staticmethod
+    def _load_ack(folder):
+        return (get_setting("alert_ack", {}) or {}).get(_folder_key(folder))
 
     def data(self, name, version, start):
         """Rows from `start` on (all rows if the client's version is outdated), column-wise."""
@@ -113,7 +218,8 @@ class Monitor:
             block = rf.buf[:, start:rf.n].copy() if rf.columns else np.empty((0, 0))
             cols = list(rf.columns)
             n = rf.n
-        return {"name": name, "v": v, "columns": cols, "start": start, "n": n, "data": block}
+            epoch = self.epoch
+        return {"name": name, "epoch": epoch, "v": v, "columns": cols, "start": start, "n": n, "data": block}
 
     def set_group(self, name, files):
         with self.lock:
@@ -123,7 +229,57 @@ class Monitor:
                 self.groups.pop(name, None)
             self.groups_version += 1
             groups = dict(self.groups)
-        save_groups(self.folder, groups)
+            folder = self.folder
+        save_groups(folder, groups)
+
+
+class Browser:
+    """Lets the web page pick another case folder, but only below `root`."""
+
+    SKIP = {"$recycle.bin", "system volume information", "__pycache__", "node_modules"}
+
+    def __init__(self, fs, root, smb, pattern):
+        self.fs, self.smb, self.pattern = fs, smb, pattern
+        self.root = normalize(root) if smb else os.path.abspath(root)
+
+    def _key(self, path):
+        return (normalize(path) if self.smb else os.path.normcase(os.path.abspath(path))).rstrip("/\\").lower()
+
+    def rel(self, folder):
+        """'a/b' for root/a/b, '' for the root itself, None if outside the root."""
+        if folder is None:
+            return None
+        r, f = self._key(self.root), self._key(folder)
+        if f == r:
+            return ""
+        sep = "/" if self.smb else os.sep
+        if r.endswith(sep):       # local filesystem root like C:\ or /
+            r = r[:-1]
+        if not f.startswith(r + sep):
+            return None
+        tail = (normalize(folder) if self.smb else os.path.abspath(folder))[len(r) + 1:]
+        return tail.replace("\\", "/").strip("/")
+
+    def resolve(self, rel):
+        parts = [p for p in str(rel or "").replace("\\", "/").split("/") if p not in ("", ".")]
+        if any(p == ".." or ":" in p for p in parts):
+            raise ValueError("invalid folder")
+        path = self.root
+        for p in parts:
+            path = self.fs.join(path, p)
+        return path
+
+    def listing(self, rel):
+        path = self.resolve(rel)
+        dirs, reports = [], 0
+        for name, is_dir in self.fs.scandir(path):
+            if is_dir:
+                if not name.startswith(".") and name.lower() not in self.SKIP:
+                    dirs.append(name)
+            elif fnmatch.fnmatch(name.lower(), self.pattern.lower()):
+                reports += 1
+        dirs.sort(key=str.lower)
+        return path, dirs, reports
 
 
 def encode_rows(block):
@@ -137,6 +293,7 @@ def encode_rows(block):
 class Handler(BaseHTTPRequestHandler):
     server_version = "fluent-monitor"
     monitor: Monitor = None
+    browser: Browser = None
     token = None
     verbose = False
 
@@ -181,7 +338,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---- routes
     def do_GET(self):
         url = urllib.parse.urlsplit(self.path)
-        query = urllib.parse.parse_qs(url.query)
+        query = urllib.parse.parse_qs(url.query, keep_blank_values=True)
         ok, set_cookie = self._authorized(query)
         if not ok:
             return self._send(403, "<h3>Access denied</h3><p>Open the link printed by fluent-monitor-web "
@@ -196,6 +353,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._static(url.path[len("/static/"):])
         if url.path == "/api/status":
             return self._json(self.monitor.status())
+        if url.path == "/api/dirs":
+            return self._dirs(query.get("path", [None])[0])
         if url.path == "/api/data":
             name = query.get("name", [""])[0]
             version = query.get("v", [""])[0]
@@ -217,18 +376,28 @@ class Handler(BaseHTTPRequestHandler):
         ok, _ = self._authorized(urllib.parse.parse_qs(url.query))
         if not ok:
             return self._json({"error": "access denied"}, 403)
-        if url.path != "/api/groups":
-            return self._json({"error": "not found"}, 404)
         try:
             n = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(min(n, 100000)) or b"{}")
+            if not isinstance(req, dict):
+                raise ValueError
+        except (ValueError, TypeError):
+            return self._json({"error": "bad request"}, 400)
+        if url.path == "/api/folder":
+            return self._set_folder(req.get("path"))
+        if url.path == "/api/alerts/ack":
+            self.monitor.acknowledge()
+            return self._json({"ok": True})
+        if url.path != "/api/groups":
+            return self._json({"error": "not found"}, 404)
+        try:
             name = str(req.get("name", "")).strip()[:120]
             files = [str(f) for f in req.get("files", [])][:50]
         except (ValueError, TypeError):
             return self._json({"error": "bad request"}, 400)
         if not name:
             return self._json({"error": "name missing"}, 400)
-        known = set(self.monitor.listing)
+        known = set(self.monitor.listing) | set(self.monitor.virtual)
         files = [f for f in files if f in known]
         if req.get("action") == "delete":
             self.monitor.set_group(name, [])
@@ -237,6 +406,38 @@ class Handler(BaseHTTPRequestHandler):
         else:
             return self._json({"error": "need at least two files"}, 400)
         return self._json({"groups": self.monitor.status()["groups"]})
+
+    # ---- case folder
+    def _dirs(self, rel):
+        b, m = self.browser, self.monitor
+        current = b.rel(m.folder)
+        if rel is None:
+            rel = current if current is not None else ""
+        try:
+            _, dirs, reports = b.listing(rel)
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        except OSError as e:
+            return self._json({"error": f"cannot open this folder: {e}", "path": b.rel(b.resolve(rel)),
+                               "root": b.root}, 502)
+        _, recent = load_web_folder()
+        recent = [r for r in (b.rel(f) for f in recent) if r is not None]
+        return self._json({"root": b.root, "path": b.rel(b.resolve(rel)), "dirs": dirs, "reports": reports,
+                           "current": current, "recent": recent})
+
+    def _set_folder(self, rel):
+        b = self.browser
+        try:
+            path = b.resolve(rel)
+            if not b.fs.isdir(path):
+                return self._json({"error": "folder not found"}, 404)
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
+        except OSError as e:
+            return self._json({"error": f"cannot open this folder: {e}"}, 502)
+        self.monitor.set_folder(path)
+        save_web_folder(path)
+        return self._json({"folder": path, "epoch": self.monitor.epoch})
 
     def _static(self, rel):
         rel = os.path.normpath(rel).replace("\\", "/")
@@ -269,52 +470,139 @@ def local_addresses():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Serve live plots of Fluent report files to browsers.")
-    ap.add_argument("folder", nargs="?", help="folder with the .out report files (default: last folder used)")
+    ap = argparse.ArgumentParser(prog="fluent-monitor",
+                                 description="Live plots of Fluent report files, residuals and solver messages "
+                                             "in the browser.")
+    ap.add_argument("folder", nargs="?",
+                    help="folder with the .out report files (Fluent's working folder), or smb://server/share/path "
+                         "(credentials in SMB_USERNAME / SMB_PASSWORD / SMB_DOMAIN); default: the folder last "
+                         "chosen in the page, otherwise $FLUENT_FOLDER, otherwise your home folder. You can switch "
+                         "folders in the page.")
+    ap.add_argument("--root", default=os.environ.get("FM_ROOT") or None,
+                    help="the web page may switch to any folder below this one (default: the share for "
+                         "smb:// folders, otherwise the drive / filesystem root); $FM_ROOT")
     ap.add_argument("--port", type=int, default=8050, help="port (default 8050)")
-    ap.add_argument("--bind", default="0.0.0.0",
-                    help="address to listen on (default: all; use 127.0.0.1 for this computer only)")
+    ap.add_argument("--lan", action="store_true",
+                    help="also accept connections from other devices (phone, other PCs); default: this computer only")
+    ap.add_argument("--bind", default=os.environ.get("FM_BIND") or None,
+                    help="address to listen on (default 127.0.0.1, with --lan 0.0.0.0); $FM_BIND")
+    ap.add_argument("--no-browser", action="store_true", default=bool(os.environ.get("FM_NO_BROWSER")),
+                    help="don't open the page in the browser at start; $FM_NO_BROWSER")
     ap.add_argument("--pattern", default="*.out", help="file pattern (default: *.out)")
-    ap.add_argument("--interval", type=float, default=1.0, help="seconds between file reads (default 1)")
+    ap.add_argument("--interval", type=float, default=float(os.environ.get("FM_INTERVAL", 1.0)),
+                    help="seconds between file reads (default 1)")
+    ap.add_argument("--public-url", default=os.environ.get("FM_PUBLIC_URL"),
+                    help="address browsers use to reach this server, e.g. http://tower:8050 (only for the "
+                         "printed link; useful in Docker)")
     ap.add_argument("--no-token", action="store_true", help="no access token (anyone who can reach the port can look)")
     ap.add_argument("--new-token", action="store_true", help="create a new access token (old links stop working)")
     ap.add_argument("--verbose", action="store_true", help="log every request")
     ap.add_argument("--debug", nargs="?", const=os.path.join(os.path.expanduser("~"), "fluent_monitor_web_debug.log"),
                     metavar="LOGFILE", help="log slow file reads")
     args = ap.parse_args()
+    if not args.bind:
+        args.bind = "0.0.0.0" if args.lan else "127.0.0.1"
 
-    folder = args.folder
-    if folder and os.path.isfile(folder):
-        folder = os.path.dirname(folder)
-    folder = os.path.abspath(folder) if folder else load_last_folder()
-    if not folder or not os.path.isdir(folder):
-        sys.exit("Give the folder with the report files, e.g.  fluent-monitor-web \"C:\\path\\to\\case\"")
-    save_last_folder(folder)
+    env_folder = os.environ.get("FLUENT_FOLDER") or None
+    saved, _ = load_web_folder()
+    if env_folder and env_folder != get_setting("web_env_folder"):
+        saved = None                  # $FLUENT_FOLDER was changed since the last start: it wins once
+        set_setting("web_env_folder", env_folder)
+    base = args.folder or env_folder or args.root or saved or load_last_folder() or os.path.expanduser("~")
+    smb = is_smb_path(base)
+    if smb:
+        from .smbfs import SMBFS
+        fs = SMBFS()
+        if not os.environ.get("SMB_USERNAME"):
+            print("warning: SMB_USERNAME is not set; trying a guest login", flush=True)
+    else:
+        fs = LOCAL_FS
+        if os.path.isfile(base):
+            base = os.path.dirname(base)
+    if args.root:
+        root = args.root
+    elif smb:
+        root = SMBFS.root(base)
+    else:
+        root = os.path.splitdrive(os.path.abspath(base))[0] + os.sep
+    browser = Browser(fs, root, smb, args.pattern)
 
-    Handler.monitor = Monitor(folder, args.pattern, args.interval, DebugLog(args.debug) if args.debug else None)
-    Handler.token = None if args.no_token else get_web_token(renew=args.new_token)
-    Handler.verbose = args.verbose
+    def usable(f):
+        return bool(f) and is_smb_path(f) == smb and browser.rel(f) is not None
+    # explicit argument > folder chosen in the web page (unless $FLUENT_FOLDER changed) > $FLUENT_FOLDER
+    # > last folder > root
+    folder = next((f for f in (args.folder, saved if usable(saved) else None, env_folder,
+                               None if smb else load_last_folder(), base, browser.root) if f and is_smb_path(f) == smb))
+    if smb:
+        folder = normalize(folder)
+    else:
+        if os.path.isfile(folder):
+            folder = os.path.dirname(folder)
+        folder = os.path.abspath(folder)
+        if not os.path.isdir(folder):
+            sys.exit(f"Folder not found: {folder}")
+        save_last_folder(folder)
+    if browser.rel(folder) is not None:
+        save_web_folder(folder)       # appears under "Recent" in the folder dialog
+    else:
+        print(f"warning: {folder} is outside {browser.root}; the web page can only switch to folders "
+              f"inside {browser.root}", flush=True)
+
+    token = None if args.no_token else get_web_token(renew=args.new_token)
+    q = f"/?token={token}" if token else "/"
+    local_url = f"http://localhost:{args.port}{q}"
     try:
         httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
     except OSError as e:
-        sys.exit(f"Cannot listen on {args.bind}:{args.port}: {e}\n(Is it already running? Try --port 8051)")
+        if _already_running(args.port):
+            print(f"fluent-monitor is already running on port {args.port}; opening it in the browser.")
+            if not args.no_browser:
+                webbrowser.open(local_url)
+            return
+        sys.exit(f"Cannot listen on {args.bind}:{args.port}: {e}\n(Another program uses the port? Try --port 8051)")
     httpd.daemon_threads = True
+    Handler.monitor = Monitor(folder, args.pattern, args.interval, DebugLog(args.debug) if args.debug else None, fs)
+    Handler.browser = browser
+    Handler.token = token
+    Handler.verbose = args.verbose
 
-    q = f"/?token={Handler.token}" if Handler.token else "/"
-    hosts = [socket.gethostname()] + local_addresses() if args.bind in ("0.0.0.0", "") else [args.bind]
-    print(f"fluent-monitor-web: watching {folder}")
-    print("Open one of these links in a browser (bookmark it; the token is remembered):")
-    for h in hosts:
-        print(f"    http://{h}:{args.port}{q}")
-    print(f"    http://localhost:{args.port}{q}   (on this computer)")
-    print("Stop with Ctrl+C.")
-    if sys.platform == "win32" and args.bind != "127.0.0.1":
-        print("If Windows asks whether to allow Python through the firewall, allow it for the networks "
-              "you want to reach it from.")
+    print(f"fluent-monitor: watching {folder}  (the page can switch to folders inside {browser.root})")
+    if args.bind == "127.0.0.1":
+        print(f"Open in a browser on this computer:  {local_url}")
+        print("(Start with --lan to reach it from your phone or another PC too.)")
+    else:
+        print("Open one of these links in a browser (bookmark it; the token is remembered):")
+        if args.public_url:
+            print(f"    {args.public_url.rstrip('/')}{q}")
+        else:
+            hosts = [socket.gethostname()] + local_addresses() if args.bind in ("0.0.0.0", "") else [args.bind]
+            for h in hosts:
+                print(f"    http://{h}:{args.port}{q}")
+            print(f"    {local_url}   (on this computer)")
+        if sys.platform == "win32":
+            print("If Windows asks whether to allow Python through the firewall, allow it for the networks "
+                  "you want to reach it from.")
+    if not args.no_browser:                         # interactive start (not Docker)
+        print("Keep this window open while you use the page. Stop with Ctrl+C or by closing the window.")
+    sys.stdout.flush()
+    if not args.no_browser:
+        threading.Timer(0.6, lambda: webbrowser.open(local_url)).start()
     try:
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("stopped")
+    sys.stdout.flush()
+
+
+def _already_running(port):
+    """Is a fluent-monitor server answering on this port of this computer?"""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=2) as r:
+            return r.headers.get("Server", "").startswith("fluent-monitor")
+    except urllib.error.HTTPError as e:              # 403 without token: still ours if the header says so
+        return e.headers.get("Server", "").startswith("fluent-monitor")
+    except OSError:
+        return False
 
 
 def run():

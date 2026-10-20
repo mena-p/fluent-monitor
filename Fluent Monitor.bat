@@ -1,7 +1,11 @@
 @echo off
-rem Double-click: opens the last folder used (or asks for one).
-rem Drag a case folder or a .out file onto this file to watch that folder.
-rem The first start downloads Python + dependencies into this project's .venv (needs internet once).
+rem Fluent monitor: starts the monitor and opens it in your browser.
+rem   Double-click: the folder you used last (switch folders in the page with "Change folder...").
+rem   Drag a case folder or a .out file onto this file: watch that folder.
+rem Keep this window open while you use the page; closing it stops the monitor.
+rem To reach it from your phone on the same network, add --lan at the end of the "uv run" line.
+rem The first start downloads Python + dependencies into this folder's .venv (needs internet once).
+title Fluent monitor
 where uv >nul 2>nul
 if errorlevel 1 (
     echo uv was not found. Install it first, see README.md:

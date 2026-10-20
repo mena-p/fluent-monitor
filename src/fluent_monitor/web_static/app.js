@@ -58,7 +58,16 @@ function fmtShort(v) {                    // log-axis ticks
 
 function tickValues(u, splits, ai) {      // plain numbers, never an offset; exponent form when huge/tiny
   if (!splits.length) return [];
-  if (u.scales[u.axes[ai].scale].distr === 3) return splits.map(fmtShort);
+  const sc = u.scales[u.axes[ai].scale];
+  if (sc.distr === 3) {                     // log axis: label decades (and 2, 5 when it spans little)
+    const decades = Math.log10(sc.max / sc.min);
+    return splits.map(v => {
+      if (v == null || !(v > 0)) return "";
+      const m = Math.round(v / 10 ** Math.floor(Math.log10(v) + 1e-9));
+      const show = decades > 2.5 ? m === 1 : decades > 1.2 ? (m === 1 || m === 5 || m === 2 && decades < 1.8) : true;
+      return show ? fmtShort(v) : "";
+    });
+  }
   const step = splits.length > 1 ? Math.abs(splits[1] - splits[0]) : (Math.abs(splits[0]) || 1);
   const maxAbs = Math.max(...splits.map(Math.abs));
   if (maxAbs >= 1e6 || (maxAbs > 0 && maxAbs < 1e-3)) {
@@ -74,7 +83,7 @@ function axisSize(u, values, ai, cycle) {  // width of the y axis from its wides
   const axis = u.axes[ai];
   if (cycle > 1) return axis._size;
   let size = axis.ticks.size + axis.gap;
-  const longest = (values || []).reduce((a, v) => (v.length > a.length ? v : a), "");
+  const longest = (values || []).reduce((a, v) => (v && v.length > a.length ? v : a), "");
   if (longest) {
     u.ctx.font = axis.font[0];
     size += u.ctx.measureText(longest).width / devicePixelRatio;
@@ -104,9 +113,13 @@ const S = {
   groups: {},               // group name -> [file names]
   ticked: [],               // keys "f:<file>" / "g:<group>"
   view: "tabs", cols: "auto", refresh: 2, current: null,
-  per: {},                  // key -> {logy, lastn, hidden: [...]}   (saved)
+  per: {},                  // key -> {logy, lastN, hidden: [...]}   (saved); lastN null = use S.lastn
+  lastn: 0,                 // "Last N" for all plots (0 = all iterations)
   offset: 0,                // server clock - browser clock (s)
   loaded: false,
+  epoch: null,              // server's folder generation; data of another epoch is dropped
+  autoTick: false,          // first visit of a folder: tick all files once they are listed
+  everLoaded: false,
 };
 const store = {};           // file name -> {v, columns, n, cols: [[...], ...], gen}
 const views = {};           // key -> {follow, x: [min,max] | null, y: [min,max] | null}   (not saved)
@@ -116,20 +129,46 @@ const storageKey = () => "fluent-monitor:" + (S.folder || "");
 function save() {
   try {
     localStorage.setItem(storageKey(), JSON.stringify(
-      {ticked: S.ticked, view: S.view, cols: S.cols, refresh: S.refresh, current: S.current, per: S.per}));
+      {ticked: S.ticked, view: S.view, cols: S.cols, refresh: S.refresh, current: S.current, per: S.per,
+       lastn: S.lastn, seenTrn: S.seenTrn}));
   } catch (e) { /* storage unavailable: settings last for this page only */ }
 }
 function restore() {
   let saved = null;
   try { saved = JSON.parse(localStorage.getItem(storageKey()) || "null"); } catch (e) { saved = null; }
   if (saved) {
-    for (const k of ["ticked", "view", "cols", "refresh", "current", "per"]) if (saved[k] != null) S[k] = saved[k];
+    for (const k of ["ticked", "view", "cols", "refresh", "current", "per", "lastn", "seenTrn"]) if (saved[k] != null) S[k] = saved[k];
+    for (const p of Object.values(S.per)) {          // before 2.5 a plot's own value was "lastn" (0 = all)
+      if (p.lastN === undefined) p.lastN = p.lastn > 0 ? p.lastn : null;
+      delete p.lastn;
+    }
   } else {
     S.ticked = S.listing.map(f => "f:" + f);      // first visit: show everything
-    S.view = narrowMQ.matches ? "tabs" : "grid";
+    S.autoTick = !S.listing.length;
+    S.current = null;
+    S.per = {};
+    S.lastn = 0;
+    S.seenTrn = S.listing.includes(RESIDUALS);
+    if (!S.everLoaded) S.view = narrowMQ.matches ? "tabs" : "grid";
   }
 }
-const per = key => (S.per[key] ||= {logy: false, lastn: 0, hidden: []});
+
+function resetClient() {                         // another case folder: start from scratch
+  for (const p of plots.values()) p.destroy();
+  plots.clear();
+  for (const k of Object.keys(store)) delete store[k];
+  for (const k of Object.keys(views)) delete views[k];
+  Object.assign(S, {loaded: false, folder: null, epoch: null, listing: [], info: {}, groups: {},
+                    ticked: [], current: null, per: {}, lastn: 0, seenTrn: false, autoTick: false});
+  plotsEl.replaceChildren();
+  tabbar.replaceChildren();
+  renderSide();
+  $("#placeholder").hidden = false;
+}
+const RESIDUALS = "Residuals";       // data sets from the Fluent transcript (see transcript.py)
+const MESSAGES = "Solver messages";  // cells/faces affected per iteration: drawn as dots
+const per = key => (S.per[key] ||= {logy: key === "f:" + RESIDUALS || key === "f:" + MESSAGES, lastN: null, hidden: []});
+const lastnOf = key => { const v = per(key).lastN; return v == null ? S.lastn : v; };   // 0 = all
 const viewOf = key => (views[key] ||= {follow: true, x: null, y: null});
 
 function keyExists(k) {
@@ -163,22 +202,39 @@ class Plot {
       p.logy = this.cbLog.checked; save(); this.vs.y = null; this.sig = null; this.update(true);
     }});
     this.cbLog.checked = !!p.logy;
-    this.edLast = h("input", {type: "number", class: "lastn", min: "0", step: "100", placeholder: "all",
-                              inputmode: "numeric", title: "Show only the last N iterations (empty: all)",
+    this.edLast = h("input", {type: "text", class: "lastn", inputmode: "numeric", autocomplete: "off",
                               onchange: () => {
-                                p.lastn = Math.max(0, parseInt(this.edLast.value, 10) || 0); save();
-                                this.edLast.value = p.lastn || "";
-                                this.gen = null; this.setFollow(true);
+                                const t = this.edLast.value.trim().toLowerCase();
+                                p.lastN = t === "" ? null : (t === "all" ? 0 : Math.max(0, parseInt(t, 10) || 0));
+                                save(); this.lastnChanged(); updateOwnNote();
                               }});
-    this.edLast.value = p.lastn || "";
+    this.btnLastReset = h("button", {class: "mini", title: "Use the setting for all plots again",
+                                     onclick: () => { p.lastN = null; save(); this.lastnChanged(); updateOwnNote(); }}, "↺");
+    this.syncLastn();
+    this.selX = h("select", {class: "xsel", title: "Quantity on the x axis", hidden: true,
+                             onchange: () => { p.xcol = this.selX.value; save(); this.vs.x = null; this.update(true); this.fit(); }});
+    this.saveMenu = h("div", {class: "savemenu", hidden: true},
+      h("button", {onclick: () => { this.saveMenu.hidden = true; this.savePng(); }}, "PNG image"),
+      h("button", {onclick: () => { this.saveMenu.hidden = true; this.saveSvg(); }}, "SVG (vector, for reports)"));
+    const saveBtn = h("button", {title: "Save the plot as an image", onclick: e => {
+      e.stopPropagation();
+      for (const m of document.querySelectorAll(".savemenu")) if (m !== this.saveMenu) m.hidden = true;
+      this.saveMenu.hidden = !this.saveMenu.hidden;
+      if (!this.saveMenu.hidden) {                 // fixed position: the toolbar may clip overflowing content
+        const r = saveBtn.getBoundingClientRect();
+        this.saveMenu.style.top = (r.bottom + 4) + "px";
+        this.saveMenu.style.left = Math.max(8, r.right - this.saveMenu.offsetWidth) + "px";
+      }
+    }}, "Save ▾");
     const bar = h("div", {class: "pbar"},
       compact ? h("span", {class: "ptitle", title: titleOf(key)}, titleOf(key)) : null,
       h("label", {title: "Keep the newest data in view"}, this.cbFollow, "Follow"),
       h("label", null, this.cbLog, "Log y"),
-      h("label", null, "Last", this.edLast),
+      h("label", null, "Last", this.edLast, this.btnLastReset),
+      this.selX,
       h("span", {class: "spacer"}),
       compact ? h("button", {title: "Open as a tab", onclick: () => openAsTab(key)}, "⤢") : null,
-      h("button", {title: "Save as PNG image", onclick: () => this.savePng()}, "PNG"));
+      h("span", {class: "savewrap"}, saveBtn, this.saveMenu));
     this.chartEl = h("div", {class: "pchart"});
     this.legendEl = h("div", {class: "plegend"});
     this.statusEl = h("div", {class: "pstatus"});
@@ -198,6 +254,24 @@ class Plot {
     this.cbFollow.checked = this.vs.follow;
   }
 
+  // "Last N": own value, or the value for all plots (shown greyed as placeholder)
+  syncLastn() {
+    const own = per(this.key).lastN;
+    this.edLast.value = own == null ? "" : (own === 0 ? "all" : String(own));
+    this.edLast.placeholder = S.lastn > 0 ? String(S.lastn) : "all";
+    this.edLast.classList.toggle("own", own != null);
+    this.btnLastReset.hidden = own == null;
+    this.edLast.title = own == null
+      ? `Show only the last N iterations of this plot. Now using the setting for all plots (${S.lastn || "all"}).`
+      : `This plot's own value (${own || "all iterations"}; type "all" or 0 for all). Clear the field or press ↺ to use the setting for all plots.`;
+  }
+
+  lastnChanged() {
+    this.syncLastn();
+    this.gen = null;
+    this.setFollow(true);
+  }
+
   destroy() {
     this.ro.disconnect();
     clearTimeout(this.resizeTimer);
@@ -214,14 +288,21 @@ class Plot {
     const perFile = srcs.map(([, s]) => { const c = s.columns.filter(isCounter); return c.length ? c : s.columns.slice(0, 1); });
     let counters = perFile.length ? perFile[0].filter(c => perFile.every(o => o.includes(c))) : [];
     if (perFile.length && !counters.length) counters = perFile[0].slice(0, 1);
-    const xname = counters[0] || "Iteration";
+    const xname = counters.includes(p.xcol) ? p.xcol : (counters[0] || "Iteration");
+    if (this.selX && JSON.stringify(counters) !== this.selX.dataset.opts) {   // x axis choice, if there is one
+      this.selX.dataset.opts = JSON.stringify(counters);
+      this.selX.replaceChildren(...counters.map(c => h("option", {value: c}, "x: " + c)));
+      this.selX.hidden = counters.length < 2;
+    }
+    if (this.selX) this.selX.value = xname;
     const combined = isGroup(this.key);
     const meta = [], tables = [];
     let k = 0;
     for (const [file, s] of srcs) {
       const xi = Math.max(0, s.columns.indexOf(xname));
       let x = s.cols[xi];
-      const from = p.lastn > 0 ? Math.max(0, x.length - p.lastn) : 0;
+      const lastn = lastnOf(this.key);
+      const from = lastn > 0 ? Math.max(0, x.length - lastn) : 0;
       if (from) x = x.slice(from);
       const table = [x];
       s.columns.forEach((name, i) => {
@@ -229,7 +310,7 @@ class Plot {
         let y = from ? s.cols[i].slice(from) : s.cols[i];
         if (p.logy) y = y.map(v => (v != null && v > 0 ? v : null));
         table.push(y);
-        meta.push({file, name, label: combined ? name : shortLabel(name), hide: `${file}|${name}`,
+        meta.push({file, name, label: combined || (S.info[file] || {}).kind === "transcript" ? name : shortLabel(name), hide: `${file}|${name}`,
                    color: PALETTE[k % 10], dash: DASHES[Math.floor(k / 10) % DASHES.length]});
         k++;
       });
@@ -241,7 +322,7 @@ class Plot {
     else data = uPlot.join(tables);
     const sig = JSON.stringify([xname, p.logy, this.compact, meta.map(m => m.hide),
                                 srcs.map(([n, s]) => s.v)]);
-    const gen = srcs.map(([n, s]) => `${n}:${s.gen}`).join("|") + "|" + p.lastn;
+    const gen = srcs.map(([n, s]) => `${n}:${s.gen}`).join("|") + "|" + lastnOf(this.key);
     return {xname, meta, data, sig, gen, srcs};
   }
 
@@ -296,6 +377,7 @@ class Plot {
       series: [{}].concat(meta.map(m => ({
         label: m.label, stroke: m.color, width: 1.25, dash: m.dash || undefined,
         points: {show: false}, spanGaps: true, show: !hidden.has(m.hide),
+        ...(m.file === MESSAGES ? {paths: () => null, points: {show: true, size: 5, width: 1, fill: m.color}} : {}),
       }))),
       cursor: {
         x: false, y: false, points: {show: false},
@@ -613,19 +695,31 @@ class Plot {
     const p = per(this.key);
     this.legendEl.replaceChildren();
     this.legendEl.hidden = this.meta.length < 2;
+    this.showAll = h("div", {class: "li showall", hidden: !this.meta.some((m, i) => !this.u.series[i + 1].show),
+                             title: "Show the hidden curves again", onclick: () => {
+      this.meta.forEach((m, i) => { if (!this.u.series[i + 1].show) this.u.setSeries(i + 1, {show: true}); });
+      p.hidden = [];
+      save();
+      this.buildLegend();
+      if (this.vs.follow) this.fit();
+    }}, "show all");
+    this.legendEl.append(this.showAll);
     this.meta.forEach((m, i) => {
       const sw = document.createElementNS("http://www.w3.org/2000/svg", "svg");
       sw.setAttribute("width", "22"); sw.setAttribute("height", "8");
-      const ln = document.createElementNS("http://www.w3.org/2000/svg", "line");
-      for (const [k, v] of Object.entries({x1: 0, y1: 4, x2: 22, y2: 4, stroke: m.color, "stroke-width": 2}))
+      const dots = m.file === MESSAGES;
+      const ln = document.createElementNS("http://www.w3.org/2000/svg", dots ? "circle" : "line");
+      for (const [k, v] of Object.entries(dots ? {cx: 11, cy: 4, r: 3, fill: m.color}
+                                               : {x1: 0, y1: 4, x2: 22, y2: 4, stroke: m.color, "stroke-width": 2}))
         ln.setAttribute(k, v);
-      if (m.dash) ln.setAttribute("stroke-dasharray", m.dash.join(" "));
+      if (m.dash && !dots) ln.setAttribute("stroke-dasharray", m.dash.join(" "));
       sw.append(ln);
       const item = h("div", {class: "li" + (this.u.series[i + 1].show ? "" : " off"), title: m.name}, sw, h("span", null, m.label));
       item.addEventListener("click", () => {
         const show = !this.u.series[i + 1].show;
         this.u.setSeries(i + 1, {show});
         item.classList.toggle("off", !show);
+        this.showAll.hidden = !this.meta.some((mm, j) => !this.u.series[j + 1].show);
         p.hidden = p.hidden.filter(x => x !== m.hide);
         if (!show) p.hidden.push(m.hide);
         save();
@@ -694,7 +788,110 @@ class Plot {
       setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     }, "image/png");
   }
+
+  // ---- SVG: vector version of what is shown (current zoom, visible curves), for reports
+  saveSvg() {
+    const u = this.u;
+    if (!u) return;
+    const r = devicePixelRatio || 1;
+    const W = u.width, H = u.height;
+    const L = u.bbox.left / r, T = u.bbox.top / r, BW = u.bbox.width / r, BH = u.bbox.height / r;
+    const title = titleOf(this.key);
+    const items = this.meta.map((m, i) => ({m, i: i + 1})).filter(x => u.series[x.i].show);
+    const meas = document.createElement("canvas").getContext("2d");
+    meas.font = `12px ${FONT}`;
+    const legW = items.length > 1 ? Math.ceil(Math.max(...items.map(x => meas.measureText(x.m.label).width))) + 46 : 0;
+    const top = 32, f = v => Math.round(v * 100) / 100;
+    const esc = t => String(t).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+    const o = [];
+    o.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W + legW}" height="${H + top}" viewBox="0 0 ${W + legW} ${H + top}" ` +
+           `font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="12">`);
+    o.push(`<rect width="100%" height="100%" fill="#fff"/>`);
+    o.push(`<text x="${f(W / 2)}" y="${top - 11}" text-anchor="middle" font-size="16">${esc(title)}</text>`);
+    o.push(`<g transform="translate(0 ${top})">`);
+    o.push(`<defs><clipPath id="area"><rect x="${f(L)}" y="${f(T)}" width="${f(BW)}" height="${f(BH)}"/></clipPath></defs>`);
+    // grid, ticks, tick labels
+    const ticks = [], grid = [], labels = [];
+    for (const [ai, sc] of [[0, "x"], [1, "y"]]) {
+      const ax = u.axes[ai], sp = ax._splits || [], vals = ax._values || [];
+      sp.forEach((v, k) => {
+        if (v == null) return;
+        const pos = u.valToPos(v, sc);
+        if (sc === "x") {
+          const x = f(L + pos);
+          if (x < L - 0.5 || x > L + BW + 0.5) return;
+          grid.push(`M${x} ${f(T)}V${f(T + BH)}`);
+          ticks.push(`M${x} ${f(T + BH)}v4`);
+          if (vals[k]) labels.push(`<text x="${x}" y="${f(T + BH + 17)}" text-anchor="middle">${esc(vals[k])}</text>`);
+        } else {
+          const y = f(T + pos);
+          if (y < T - 0.5 || y > T + BH + 0.5) return;
+          grid.push(`M${f(L)} ${y}H${f(L + BW)}`);
+          ticks.push(`M${f(L)} ${y}h-4`);
+          if (vals[k]) labels.push(`<text x="${f(L - 7)}" y="${y}" dy="0.35em" text-anchor="end">${esc(vals[k])}</text>`);
+        }
+      });
+    }
+    o.push(`<path d="${grid.join("")}" stroke="#000" stroke-opacity="0.11" fill="none"/>`);
+    // curves (thinned to ~4 points per pixel column, keeping each column's min and max)
+    const xs = u.data[0];
+    o.push(`<g clip-path="url(#area)" fill="none" stroke-width="1.25" stroke-linejoin="round">`);
+    for (const {m, i} of items) {
+      const ys = u.data[i], dots = m.file === MESSAGES, pts = [];
+      let col = null, lo = null, hi = null, first = null, last = null;
+      const flushCol = () => {
+        if (first == null) return;
+        const seq = [first, lo, hi, last].filter((p, k, a) => p && a.indexOf(p) === k).sort((a, b) => a.j - b.j);
+        for (const p of seq) pts.push(p);
+        first = lo = hi = last = null;
+      };
+      for (let j = 0; j < xs.length; j++) {
+        const y = ys[j];
+        if (y == null || !isFinite(y)) continue;
+        const px = L + u.valToPos(xs[j], "x"), py = T + u.valToPos(y, "y");
+        if (!isFinite(px) || !isFinite(py)) continue;
+        const p = {x: px, y: py, j};
+        if (dots) { pts.push(p); continue; }
+        const c = Math.floor(px * 4);
+        if (c !== col) { flushCol(); col = c; first = lo = hi = p; }
+        if (py < hi.y) hi = p;
+        if (py > lo.y) lo = p;
+        last = p;
+      }
+      flushCol();
+      if (!pts.length) continue;
+      if (dots) {
+        o.push(`<g fill="${m.color}" stroke="none">` + pts.map(p => `<circle cx="${f(p.x)}" cy="${f(p.y)}" r="2.5"/>`).join("") + `</g>`);
+      } else {
+        o.push(`<path stroke="${m.color}"${m.dash ? ` stroke-dasharray="${m.dash.join(" ")}"` : ""} d="M` +
+               pts.map(p => `${f(p.x)} ${f(p.y)}`).join("L") + `"/>`);
+      }
+    }
+    o.push(`</g>`);
+    o.push(`<path d="${ticks.join("")}" stroke="#000" fill="none"/>`);
+    o.push(`<rect x="${f(L)}" y="${f(T)}" width="${f(BW)}" height="${f(BH)}" fill="none" stroke="#000"/>`);
+    o.push(...labels);
+    const xl = u.axes[0].label, yl = u.axes[1].label;
+    if (xl) o.push(`<text x="${f(L + BW / 2)}" y="${f(H - 5)}" text-anchor="middle" font-size="13">${esc(xl)}</text>`);
+    if (yl) o.push(`<text transform="translate(13 ${f(T + BH / 2)}) rotate(-90)" text-anchor="middle" font-size="13">${esc(yl)}</text>`);
+    items.forEach(({m}, k) => {                                 // legend
+      if (items.length < 2) return;
+      const x = W + 8, y = T + 8 + k * 18;
+      o.push(m.file === MESSAGES ? `<circle cx="${x + 12}" cy="${y}" r="3" fill="${m.color}"/>`
+        : `<path d="M${x} ${y}h24" stroke="${m.color}" stroke-width="2"${m.dash ? ` stroke-dasharray="${m.dash.join(" ")}"` : ""}/>`);
+      o.push(`<text x="${x + 30}" y="${y}" dy="0.35em">${esc(m.label)}</text>`);
+    });
+    o.push(`</g></svg>`);
+    const blob = new Blob([o.join("\n")], {type: "image/svg+xml"});
+    const a = h("a", {href: URL.createObjectURL(blob), download: title.replace(/[\\/:*?"<>|]+/g, "_") + ".svg"});
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
 }
+
+const hideSaveMenus = () => { for (const m of document.querySelectorAll(".savemenu")) m.hidden = true; };
+document.addEventListener("click", hideSaveMenus);
+document.addEventListener("scroll", hideSaveMenus, true);
 
 // ------------------------------------------------------------------ page layout
 const plotsEl = $("#plots"), tabbar = $("#tabbar");
@@ -702,6 +899,11 @@ const plotsEl = $("#plots"), tabbar = $("#tabbar");
 function render() {
   const keys = orderedTicked();
   $("#placeholder").hidden = keys.length > 0;
+  const empty = S.loaded && !S.listing.length;      // e.g. first start in the home folder
+  $("#ph-text").textContent = empty ? `No report files or Fluent transcripts in ${S.folder} yet.`
+                                    : "Tick report files to plot them.";
+  $("#btn-ph-folder").hidden = !empty;
+  $("#btn-open-files").hidden = empty;
   $("#btn-tabs").classList.toggle("on", S.view === "tabs");
   $("#btn-grid").classList.toggle("on", S.view === "grid");
   plotsEl.className = S.view;
@@ -731,6 +933,7 @@ function render() {
     layoutGrid();
     for (const k of keys) plots.get(k).update();
   }
+  updateOwnNote();
   save();
 }
 
@@ -784,13 +987,13 @@ tabbar.addEventListener("wheel", e => {
 // ------------------------------------------------------------------ side panel
 function renderSide() {
   const ticked = new Set(S.ticked);
-  const item = (key, text, del) => h("li", null,
+  const item = (key, text, del) => h("li", {class: S.info[keyName(key)] && S.info[keyName(key)].kind === "transcript" ? "trn" : null},
     h("label", {title: text},
       h("input", {type: "checkbox", checked: ticked.has(key), onchange: e => toggleKey(key, e.target.checked)}),
       h("span", null, text)),
     del ? h("button", {class: "del", title: "Delete this combined plot", onclick: del}, "×") : null);
   $("#file-list").replaceChildren(...S.listing.map(f => item("f:" + f, f)));
-  if (!S.listing.length) $("#file-list").append(h("li", {class: "hint"}, "No report files in this folder yet."));
+  if (!S.listing.length) $("#file-list").append(h("li", {class: "hint"}, "No report files or transcripts in this folder yet."));
   const groups = Object.keys(S.groups);
   $("#group-head").hidden = !groups.length;
   $("#group-list").replaceChildren(...groups.map(g =>
@@ -858,6 +1061,27 @@ $("#btn-combine").addEventListener("click", combine);
 $("#btn-tabs").addEventListener("click", () => { S.view = "tabs"; render(); });
 $("#btn-grid").addEventListener("click", () => { S.view = "grid"; render(); });
 $("#sel-cols").addEventListener("change", e => { S.cols = e.target.value; save(); layoutGrid(); });
+$("#inp-lastn").addEventListener("change", e => {
+  S.lastn = Math.max(0, parseInt(e.target.value, 10) || 0);
+  e.target.value = S.lastn || "";
+  save();
+  for (const p of plots.values()) {
+    if (per(p.key).lastN == null) p.lastnChanged();
+    else p.syncLastn();
+  }
+});
+$("#btn-own-reset").addEventListener("click", () => {
+  for (const p of Object.values(S.per)) p.lastN = null;
+  save();
+  for (const p of plots.values()) p.lastnChanged();
+  updateOwnNote();
+});
+
+function updateOwnNote() {                  // "2 plots use their own value · reset"
+  const own = orderedTicked().filter(k => S.per[k] && S.per[k].lastN != null).length;
+  $("#own-note").hidden = !own;
+  $("#own-count").textContent = own === 1 ? "1 plot uses its own value" : `${own} plots use their own value`;
+}
 $("#sel-refresh").addEventListener("change", e => { S.refresh = +e.target.value; save(); poll(true); });
 
 let layoutTimer = 0;
@@ -878,6 +1102,7 @@ async function fetchFile(name) {
   if (s && s.v === info.v && s.n === info.n) return false;
   const from = s && s.v === info.v && info.n >= s.n ? s.n : 0;
   const d = await api(`/api/data?name=${encodeURIComponent(name)}&v=${encodeURIComponent(s ? s.v : "")}&from=${from}`);
+  if (d.epoch !== S.epoch) return false;          // answer for the previous folder
   if (!s || d.start === 0 || d.v !== s.v || d.start !== s.n) {
     s = store[name] = {v: d.v, columns: d.columns, n: d.n, cols: d.data.map(c => c.slice()), gen: 0};
     if (s.cols.length < d.columns.length) s.cols = d.columns.map((_, i) => d.data[i] || []);
@@ -895,9 +1120,17 @@ async function poll(now) {
   if (polling) { pollAgain = true; return; }
   if (document.hidden && !now) { pollTimer = setTimeout(poll, S.refresh * 1000); return; }
   polling = true;
+  let soon = false;
   try {
     const st = await api("/api/status");
     S.offset = st.server_time - Date.now() / 1000;
+    if (S.loaded && st.epoch !== S.epoch) resetClient();      // folder changed (here or in another browser)
+    const listed = st.last_read != null && !st.error;         // the folder has been read at least once
+    if (!S.loaded && st.last_read == null && !st.error) {    // server is still reading the new folder
+      setConn("live", "reading folder…");
+      soon = true;
+      return;
+    }
     const listingChanged = JSON.stringify(st.files.map(f => f.name)) !== JSON.stringify(S.listing)
                         || JSON.stringify(st.groups) !== JSON.stringify(S.groups);
     S.listing = st.files.map(f => f.name);
@@ -905,16 +1138,35 @@ async function poll(now) {
     S.groups = st.groups || {};
     if (!S.loaded) {
       S.folder = st.folder;
+      S.epoch = st.epoch;
+      const caseName = st.folder.split(/[\\/]/).filter(Boolean).pop() || st.folder;
       $("#folder").textContent = st.folder;
-      $("#folder").title = st.folder;
-      document.title = "Fluent monitor – " + st.folder.split(/[\\/]/).filter(Boolean).pop();
+      $("#folder").title = st.folder + " – click to change";
+      $("#case-name").textContent = caseName;
+      $("#case-name").title = st.folder;
+      document.title = "Fluent monitor – " + caseName;
+      iconState = undefined;
       restore();
       $("#sel-cols").value = S.cols;
       $("#sel-refresh").value = String(S.refresh);
-      S.loaded = true;
+      $("#inp-lastn").value = S.lastn || "";
+      S.loaded = S.everLoaded = true;
+      render();
+    }
+    renderSolver(st.solver || {state: "none"});
+    if (S.loaded && !S.seenTrn && S.listing.includes(RESIDUALS)) {   // residuals appeared: show them once
+      S.seenTrn = true;
+      if (!S.ticked.includes("f:" + RESIDUALS)) S.ticked.unshift("f:" + RESIDUALS);
+      renderSide();
+      render();
+    }
+    if (S.autoTick && listed && S.listing.length) {
+      S.ticked = S.listing.map(f => "f:" + f);
+      S.autoTick = false;
+      render();
     }
     if (listingChanged || !plots.size) {
-      S.ticked = S.ticked.filter(keyExists);
+      if (listed) S.ticked = S.ticked.filter(keyExists);   // keep the selection while the folder is unreachable
       renderSide();
     }
     const keys = orderedTicked();
@@ -926,17 +1178,223 @@ async function poll(now) {
     // connection indicator: data age of the plotted files
     const newest = Math.max(0, ...need.map(n => S.info[n].last_change || 0), ...(need.length ? [] : st.files.map(f => f.last_change || 0)));
     const age = st.server_time - newest;
-    if (newest && age > STALE_AFTER) setConn("stale", `no new data for ${ago(age)}`);
+    if (st.error) setConn("stale", "report folder not reachable (VPN down?)");
+    else if (newest && age > STALE_AFTER) setConn("stale", `no new data for ${ago(age)}`);
     else setConn("live", "live");
   } catch (e) {
     if (e.denied) setConn("down", "access denied – open the link with ?token= again");
     else setConn("down", "server not reachable");
   } finally {
     polling = false;
+    if (pollAgain) { pollAgain = false; poll(true); }
+    else pollTimer = setTimeout(poll, soon ? 400 : S.refresh * 1000);
   }
-  if (pollAgain) { pollAgain = false; return poll(true); }
-  pollTimer = setTimeout(poll, S.refresh * 1000);
 }
+
+// ------------------------------------------------------------------ solver health (transcript)
+let solver = {state: "none"};
+const HEALTH_TEXT = {running: "Solver running", converged: "Converged", idle: "Solver idle", closed: "Fluent closed",
+                     warning: "Warning", critical: "Problem"};
+
+function plural(n, w) { return `${n} ${w}${n === 1 ? "" : "s"}`; }
+
+function iterInfo(g) {
+  if (g.last_iter == null) return "before the first iteration";
+  let t = `iteration ${g.last_iter}`;
+  if (g.ago != null) t += g.ago <= 2 ? " · ongoing" : ` · ${plural(g.ago, "iteration")} ago`;
+  if (g.count > 1 && g.first_iter != null && g.first_iter !== g.last_iter) t += ` · first at ${g.first_iter}`;
+  return t;
+}
+
+function renderSolver(sv) {
+  solver = sv;
+  const chip = $("#health");
+  chip.hidden = sv.state === "none";
+  if (chip.hidden) { $("#banner").hidden = true; setIcon("ok"); return; }
+  const fresh = (sv.current || []).filter(g => g.new && (g.sev === "critical" || g.sev === "warning"));
+  const top = fresh[0];
+  let text = HEALTH_TEXT[sv.state] || sv.state;
+  if (sv.state === "running" && sv.iteration != null) text += ` · it ${sv.iteration}`;
+  if (sv.state === "idle" && sv.age != null) text += ` ${ago(sv.age)}`;
+  if ((sv.state === "critical" || sv.state === "warning") && top) {
+    text = top.title + (fresh.length > 1 ? ` +${fresh.length - 1}` : "");
+  }
+  chip.className = "health " + sv.state;
+  $("#health-text").textContent = text;
+  chip.title = text + " – click for the solver messages";
+  // banner
+  const banner = $("#banner");
+  if (top) {
+    banner.className = "banner " + sv.state;
+    const parts = fresh.slice(0, 3).map(g => `${g.title}${g.amount ? ` (${g.amount})` : ""}${g.count > 1 ? ` ×${g.count}` : ""}`);
+    $("#banner-text").textContent = (sv.state === "critical" ? "⛔ " : "⚠ ") + parts.join(" · ")
+      + (top.last_iter != null ? ` — last at iteration ${top.last_iter}` : "") + (fresh.length > 3 ? ` · +${fresh.length - 3} more` : "");
+    banner.hidden = false;
+  } else banner.hidden = true;
+  setIcon(sv.state);
+  if ($("#dlg-alerts").open) renderAlerts();
+}
+
+let iconState = null;
+function setIcon(state) {
+  const color = state === "critical" ? "%23c62828" : state === "warning" ? "%23e69500" : null;
+  if (iconState === color) return;
+  iconState = color;
+  const line = "%3Cpath d='M1 13 L5 6 L8 9 L15 2' fill='none' stroke='%231f77b4' stroke-width='2'/%3E";
+  const dot = color ? `%3Ccircle cx='12' cy='12' r='4' fill='${color}'/%3E` : "";
+  $("#favicon").href = `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E${line}${dot}%3C/svg%3E`;
+  const base = document.title.replace(/^(⛔|⚠) /, "");
+  document.title = (state === "critical" ? "⛔ " : state === "warning" ? "⚠ " : "") + base;
+}
+
+function alertItem(g) {
+  const tags = [];
+  if (g.new && (g.sev === "critical" || g.sev === "warning")) tags.push(h("span", {class: "tag on"}, "new"));
+  else if (g.ago != null && g.ago <= 2) tags.push(h("span", {class: "tag"}, "ongoing"));
+  return h("li", null,
+    h("span", {class: "sev " + g.sev}),
+    h("span", {class: "t"}, g.title, ...tags),
+    h("span", {class: "cnt"}, g.count > 1 ? `×${g.count}` : ""),
+    h("span", {class: "meta"}, (g.amount ? `last: ${g.amount} · ` : "") + iterInfo(g)),
+    h("span", {class: "line"}, g.last_text));
+}
+
+function renderAlerts() {
+  const sv = solver;
+  const cur = sv.current || [];
+  $("#alerts-sub").textContent = sv.transcript
+    ? `${sv.transcript}${sv.iteration != null ? ` · iteration ${sv.iteration}` : ""} · ${HEALTH_TEXT[sv.state] || sv.state}`
+    : "No transcript found";
+  $("#alert-list").replaceChildren(...(cur.length ? cur.map(alertItem)
+    : [h("li", {class: "empty"}, "No messages in the current Fluent session.")]));
+  const old = sv.earlier || [];
+  $("#alerts-earlier").hidden = !old.length;
+  $("#alert-earlier").replaceChildren(...old.map(alertItem));
+  $("#btn-alerts-ack").disabled = !cur.some(g => g.new);
+}
+
+function openAlerts() {
+  closeSide();
+  renderAlerts();
+  $("#dlg-alerts").returnValue = "";
+  if (typeof $("#dlg-alerts").showModal === "function") $("#dlg-alerts").showModal();
+}
+
+async function acknowledge() {
+  try { await api("/api/alerts/ack", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"}); }
+  catch (e) { alert("Could not mark as seen: " + e.message); return; }
+  poll(true);
+}
+
+$("#health").addEventListener("click", openAlerts);
+$("#btn-banner-details").addEventListener("click", openAlerts);
+$("#btn-banner-ack").addEventListener("click", acknowledge);
+$("#dlg-alerts").addEventListener("close", () => { if ($("#dlg-alerts").returnValue === "ack") acknowledge(); });
+$("#dlg-alerts").addEventListener("click", e => { if (e.target === $("#dlg-alerts")) $("#dlg-alerts").close("close"); });
+
+// ------------------------------------------------------------------ case folder dialog
+const dlg = $("#dlg-folder");
+let browsePath = "", browseRoot = "", browseCurrent = null;
+
+function rootLabel(root) {
+  const parts = root.split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : root;
+}
+
+function renderCrumbs(path) {
+  const parts = path ? path.split("/") : [];
+  const items = [parts.length ? h("button", {type: "button", title: browseRoot, onclick: () => browse("")}, rootLabel(browseRoot))
+                              : h("span", {class: "here", title: browseRoot}, rootLabel(browseRoot))];
+  parts.forEach((p, i) => {
+    items.push(h("span", {class: "sep"}, "/"));
+    const sub = parts.slice(0, i + 1).join("/");
+    items.push(i === parts.length - 1 ? h("span", {class: "here"}, p)
+                                      : h("button", {type: "button", onclick: () => browse(sub)}, p));
+  });
+  $("#crumbs").replaceChildren(...items);
+}
+
+function folderIcon() {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16"); svg.setAttribute("width", "16"); svg.setAttribute("height", "16");
+  svg.setAttribute("class", "ico");
+  const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  p.setAttribute("d", "M1.5 3.5h4.5l1.5 1.5h7v8.5h-13z");
+  p.setAttribute("fill", "currentColor");
+  svg.append(p);
+  return svg;
+}
+
+const dirButton = (label, title, onclick, extra) => h("li", null,
+  h("button", {type: "button", title, onclick}, folderIcon(), h("span", {class: "nm"}, label), extra || null));
+
+async function browse(path) {
+  const list = $("#dir-list"), info = $("#dir-info"), use = $("#btn-use");
+  list.replaceChildren(h("li", {class: "empty"}, "loading…"));
+  use.disabled = true;
+  info.textContent = "";
+  info.className = "dir-info";
+  let r;
+  try {
+    r = await api("/api/dirs" + (path == null ? "" : "?path=" + encodeURIComponent(path)));
+  } catch (e) {
+    if (path != null) { browsePath = path; renderCrumbs(path); }
+    list.replaceChildren(h("li", {class: "err"}, e.message));
+    return;
+  }
+  browseRoot = r.root;
+  browsePath = r.path || "";
+  browseCurrent = r.current;
+  renderCrumbs(browsePath);
+  const join = n => (browsePath ? browsePath + "/" + n : n);
+  const rows = [];
+  if (browsePath) {
+    const up = browsePath.split("/").slice(0, -1).join("/");
+    rows.push(dirButton("..", "Up one level", () => browse(up)));
+  }
+  for (const d of r.dirs) {
+    const here = r.current != null && (r.current === join(d) || r.current.startsWith(join(d) + "/"));
+    rows.push(dirButton(d, d, () => browse(join(d)),
+                        here ? h("span", {class: "cur"}, r.current === join(d) ? "watching" : "▸ watching inside") : null));
+  }
+  if (!r.dirs.length) rows.push(h("li", {class: "empty"}, "No subfolders."));
+  list.replaceChildren(...rows);
+  const recent = r.recent.filter(x => x !== browsePath).slice(0, 6);
+  $("#recent-box").hidden = !recent.length;
+  $("#recent-list").replaceChildren(...recent.map(x =>
+    dirButton(x || rootLabel(browseRoot), x, () => browse(x), x === r.current ? h("span", {class: "cur"}, "watching") : null)));
+  if (browsePath === r.current) {
+    info.textContent = `Watching this folder (${r.reports} report file${r.reports === 1 ? "" : "s"})`;
+    use.disabled = true;
+  } else {
+    info.textContent = r.reports ? `${r.reports} report file${r.reports === 1 ? "" : "s"} here` : "No report files here (yet)";
+    info.classList.toggle("has", r.reports > 0);
+    use.disabled = false;
+  }
+}
+
+function openFolderDialog() {
+  closeSide();
+  if (typeof dlg.showModal !== "function") { alert("This browser cannot show the folder dialog."); return; }
+  dlg.returnValue = "";
+  dlg.showModal();
+  browse(null);
+}
+
+dlg.addEventListener("close", async () => {
+  if (dlg.returnValue !== "use") return;
+  try {
+    await api("/api/folder", {method: "POST", headers: {"Content-Type": "application/json"},
+                              body: JSON.stringify({path: browsePath})});
+  } catch (e) { alert("Could not switch the folder: " + e.message); return; }
+  resetClient();
+  setConn("live", "reading folder…");
+  poll(true);
+});
+dlg.addEventListener("click", e => { if (e.target === dlg) dlg.close("cancel"); });   // click on the backdrop
+$("#folder").addEventListener("click", openFolderDialog);
+$("#btn-folder").addEventListener("click", openFolderDialog);
+$("#btn-ph-folder").addEventListener("click", openFolderDialog);
 
 document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(true); });
 setInterval(() => { for (const p of plots.values()) if (p.el.isConnected) p.updateStatus(); }, 1000);

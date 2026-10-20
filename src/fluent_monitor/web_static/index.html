@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#ffffff">
 <title>Fluent monitor</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M1 13 L5 6 L8 9 L15 2' fill='none' stroke='%231f77b4' stroke-width='2'/%3E%3C/svg%3E">
+<link id="favicon" rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M1 13 L5 6 L8 9 L15 2' fill='none' stroke='%231f77b4' stroke-width='2'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/uPlot.min.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -14,8 +14,9 @@
   <button id="btn-menu" class="icon-btn" aria-label="Report files" title="Report files">&#9776;</button>
   <div class="brand">
     <span class="app-name">Fluent monitor</span>
-    <span id="folder" class="folder"></span>
+    <button id="folder" class="folder" title="Change the case folder"></button>
   </div>
+  <button id="health" class="health" hidden title="Solver messages from the transcript"><span class="dot"></span><span id="health-text"></span></button>
   <div id="conn" class="conn" title="Connection to the server"><span class="dot"></span><span id="conn-text">connecting…</span></div>
   <div class="seg" role="group" aria-label="View">
     <button id="btn-tabs" class="seg-btn">Tabs</button>
@@ -28,6 +29,10 @@
     <div class="side-head">
       <span>Report files</span>
       <button id="btn-close-side" class="icon-btn only-narrow" aria-label="Close">&times;</button>
+    </div>
+    <div class="case">
+      <div class="case-name" id="case-name" title="">–</div>
+      <button id="btn-folder" title="Watch another case folder">Change folder…</button>
     </div>
     <ul id="file-list" class="checklist"></ul>
     <div id="group-head" class="side-sub" hidden>Combined plots</div>
@@ -43,6 +48,9 @@
           <option value="auto">auto</option><option>1</option><option>2</option><option>3</option><option>4</option>
         </select>
       </label>
+      <label title="Show only the last N iterations in every plot (empty: all). A plot's own value, set in its toolbar, wins.">Last iterations
+        <input id="inp-lastn" type="number" class="lastn" min="0" step="100" placeholder="all" inputmode="numeric">
+      </label>
       <label>Refresh
         <select id="sel-refresh">
           <option value="1">1 s</option><option value="2" selected>2 s</option><option value="5">5 s</option>
@@ -50,20 +58,73 @@
         </select>
       </label>
     </div>
+    <p id="own-note" class="hint own-note" hidden><span id="own-count"></span> for “Last” · <button id="btn-own-reset" class="linkish">use this for all</button></p>
     <p class="hint only-wide">Wheel: zoom (Shift: y only, Ctrl: x only) · drag: zoom box · double-click: reset</p>
     <p class="hint only-touch">Two fingers: zoom / pan · tap: value · double-tap: reset</p>
   </aside>
   <div id="scrim"></div>
 
   <main id="main">
+    <div id="banner" class="banner" hidden>
+      <span id="banner-text"></span>
+      <span class="banner-actions">
+        <button id="btn-banner-details">Details</button>
+        <button id="btn-banner-ack" title="Turn the light green again until new messages arrive">Mark as seen</button>
+      </span>
+    </div>
     <nav id="tabbar" hidden></nav>
     <div id="plots"></div>
     <div id="placeholder">
-      <p>Tick report files to plot them.</p>
+      <p id="ph-text">Tick report files to plot them.</p>
       <button id="btn-open-files" class="only-narrow">Choose files</button>
+      <button id="btn-ph-folder" class="primary" hidden>Change folder…</button>
     </div>
   </main>
 </div>
+
+<dialog id="dlg-folder" aria-labelledby="dlg-title">
+  <form method="dialog" class="dlg">
+    <div class="dlg-head">
+      <span id="dlg-title">Case folder</span>
+      <button value="cancel" class="icon-btn" aria-label="Close">&times;</button>
+    </div>
+    <nav id="crumbs" class="crumbs"></nav>
+    <div id="dlg-body" class="dlg-body">
+      <ul id="dir-list" class="dirs"></ul>
+      <div id="recent-box" hidden>
+        <div class="side-sub">Recent</div>
+        <ul id="recent-list" class="dirs"></ul>
+      </div>
+    </div>
+    <div class="dlg-foot">
+      <span id="dir-info" class="dir-info"></span>
+      <button value="cancel">Cancel</button>
+      <button id="btn-use" value="use" class="primary">Watch this folder</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-alerts" aria-labelledby="alerts-title">
+  <form method="dialog" class="dlg">
+    <div class="dlg-head">
+      <span id="alerts-title">Solver messages</span>
+      <button value="close" class="icon-btn" aria-label="Close">&times;</button>
+    </div>
+    <div id="alerts-sub" class="alerts-sub"></div>
+    <div class="dlg-body">
+      <ul id="alert-list" class="alerts"></ul>
+      <details id="alerts-earlier" hidden>
+        <summary>Earlier Fluent sessions</summary>
+        <ul id="alert-earlier" class="alerts"></ul>
+      </details>
+    </div>
+    <div class="dlg-foot">
+      <span class="dir-info">From the Fluent transcript (*.trn) in the case folder</span>
+      <button value="close">Close</button>
+      <button id="btn-alerts-ack" value="ack" class="primary">Mark all as seen</button>
+    </div>
+  </form>
+</dialog>
 
 <script src="/static/uPlot.iife.min.js"></script>
 <script src="/static/app.js"></script>
