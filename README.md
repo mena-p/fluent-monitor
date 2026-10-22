@@ -173,6 +173,19 @@ icon. Click the light (or *Details*) for the list:
 **Mark as seen** turns the light back to green until a *new* message arrives. This is saved
 on the server, so it applies to every browser and phone.
 
+## Security
+
+- The page and every request need the access token from the link. The token is
+  remembered in an HttpOnly cookie, and the settings file that holds it is readable only
+  by you.
+- By default the monitor only listens on your own computer. With `--lan`, anyone on the
+  network who has the link can open it. The traffic is plain HTTP, so use it on networks
+  you trust, or over Tailscale.
+- The page only reads files: report files and transcripts in folders below `--root`. It
+  never writes to your case folders and cannot run commands.
+- Requests from other websites are refused, and the page refuses to be embedded in other
+  sites.
+
 ## Getting to it from your phone
 
 The monitor only needs to be reachable from the phone. It should **not** be open to the

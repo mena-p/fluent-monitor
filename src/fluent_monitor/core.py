@@ -256,6 +256,10 @@ def get_web_token(renew=False):
     (so a bookmarked link keeps working across restarts)."""
     import secrets
     with _settings_lock:
+        try:
+            os.chmod(SETTINGS, 0o600)       # files from versions before 3.1 were readable by everyone
+        except OSError:
+            pass
         d = _load_settings()
         tok = d.get("web_token")
         if renew or not tok:
@@ -278,9 +282,14 @@ _settings_lock = threading.RLock()   # the web server saves from several threads
 
 
 def _save_settings(d):
+    """Write atomically and readable only by the owner: the file holds the web access token."""
+    tmp = SETTINGS + ".tmp"
     try:
-        with open(SETTINGS, "w", encoding="utf-8") as fh:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(d, fh, indent=1)
+        os.replace(tmp, SETTINGS)
+        os.chmod(SETTINGS, 0o600)
     except OSError:
         pass
 

@@ -30,6 +30,7 @@ RESIDUALS = "Residuals"            # names of the two data sets in the file list
 PRINTED = "Printed reports"
 MESSAGES = "Solver messages"       # cells/faces affected by limiter / time step messages, per iteration
 MAX_TRANSCRIPTS = 10               # older sessions are not read (saves time on a slow share)
+MAX_LINE = 2000                    # characters of a transcript line that are looked at
 
 # Columns of the residual table that are report definitions printed to the console rather than
 # equations. Equation names can be anything (species are named by the user, e.g. "exhaust"), so
@@ -216,6 +217,8 @@ class TranscriptSource:
                 rows = []
 
         for lineno, text in lines:
+            if len(text) > MAX_LINE:              # no Fluent line is this long; keeps the regexes cheap
+                text = text[:MAX_LINE]
             toks = text.split()
             if not toks:
                 continue
@@ -231,7 +234,7 @@ class TranscriptSource:
             if t0 == "auto-transcript" and len(toks) > 1 and toks[1].lower() == "stop":
                 s.closed = True                            # Fluent was closed
                 continue
-            if s.names and t0.isdigit() and len(toks) >= len(s.names) + 1:
+            if s.names and t0.isdigit() and len(t0) <= 12 and len(toks) >= len(s.names) + 1:
                 # a row has exactly the header's values, written like 1.2345e-03, then time/iter
                 # (other number lines, e.g. after "Warning: Invalid data at line:", must not count)
                 vt = toks[1:len(s.names) + 1]

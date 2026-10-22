@@ -76,8 +76,13 @@ nano .env
 
 ## 4. Build and start
 
+The monitor runs as Unraid's `nobody:users` (99:100), not as root, so give it its data folder
+first:
+
 ```bash
-docker compose up -d --build
+mkdir -p data && chown 99:100 data
+docker compose build --pull
+docker compose up -d
 docker compose logs fluent-monitor
 ```
 
@@ -92,7 +97,9 @@ Check the tunnel with `docker compose logs wireguard`. It should end without err
 - **eduVPN file expired** (90 days by default): download a new one, replace `wg0.conf`, then
   `docker compose restart wireguard`. The monitor restarts with it. Until then, the page
   shows "report folder not reachable (VPN down?)" and keeps the data it already has.
-- **After changing the code:** `docker compose up -d --build`.
+- **After changing the code, and every month or so for security updates of the base
+  system:** `docker compose build --pull && docker compose up -d`. Also run
+  `docker compose pull wireguard` from time to time.
 - **Stop:** `docker compose down`.
 - **Another case folder:** in the web page, open ☰ → *Change folder…* (or click the folder
   name at the top), browse to the case and press *Watch this folder*. Every open browser
@@ -110,3 +117,23 @@ Check the tunnel with `docker compose logs wireguard`. It should end without err
 | `STATUS_LOGON_FAILURE` | wrong username or password; try `SMB_USERNAME=user@uni.example` or set `SMB_DOMAIN` |
 | `STATUS_BAD_NETWORK_NAME` | the share name (first part after the server) is wrong; check `net use` on Windows |
 | name doesn't resolve | use the server's IP address in `FLUENT_FOLDER` |
+| log says "cannot write to /data" | `chown 99:100 data` in the `docker` folder, then `docker compose restart fluent-monitor` |
+
+## Security
+
+- **Access token:** the page and every request need the token (128 bits). It's kept in
+  `data/.fluent_monitor.json`, readable only by its owner. Anyone with the link can watch
+  and switch folders, so share it like a password. `--new-token` (or deleting that file)
+  makes old links stop working.
+- **Plain HTTP:** on your home network the token travels unencrypted, like any LAN web UI.
+  From outside, use Tailscale (encrypted). Don't forward port 8050 on your router.
+- **The container:**
+  - runs as `nobody:users`, with no Linux capabilities
+  - can't gain privileges, and its system files are read-only
+  - can only reach the network through the eduVPN tunnel
+- **What the page can do:** read report files and transcripts in folders below `FM_ROOT`,
+  plus Unraid-side settings (combined plots, the chosen folder). It never writes to the
+  share and cannot run commands.
+- **Your credentials:** `.env` (share password) and `wg0.conf` (VPN key) should be
+  `chmod 600`. Anyone who can run `docker inspect` on Unraid can see the share password,
+  which is normal for container environment variables.

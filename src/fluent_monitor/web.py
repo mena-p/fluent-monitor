@@ -13,6 +13,7 @@ for smb:// folders). The same program runs in Docker (see docker/README.md).
 import argparse
 import fnmatch
 import gzip
+import hmac
 import json
 import os
 import socket
@@ -37,6 +38,18 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_stati
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                 ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".txt": "text/plain; charset=utf-8"}
 COOKIE = "fm_token"
+STATIC_FILES = frozenset(os.listdir(STATIC_DIR))      # the only files /static/ serves
+MAX_BODY = 100_000                                     # bytes accepted in a POST
+MAX_CONNECTIONS = 128                                  # connections handled at the same time
+MAX_PER_IP = 32                                        # ... and at most this many from one address
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                                "img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; "
+                                "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"),
+}
 
 
 # --------------------------------------------------------------------------- data side
@@ -86,69 +99,79 @@ class Monitor:
 
     def _run(self):
         while True:
+            try:
+                wait = self._pass()
+            except Exception as e:            # one bad file must not stop the monitoring
+                print(f"error while reading {self.folder}: {type(e).__name__}: {e}", flush=True)
+                wait = True
+            if wait:
+                self._wake.wait(self.interval)
+                self._wake.clear()
+
+    def _pass(self):
+        """One read pass over the folder. False: the folder changed meanwhile, start over at once."""
+        with self.lock:
+            epoch, folder = self.epoch, self.folder
+        now = time.time()
+        if now - self._last_scan >= self.SCAN_EVERY or not self.listing:
+            self._last_scan = now
+            error = None
+            try:
+                names = self.fs.listdir(folder)
+                listing = sorted(f for f in names if fnmatch.fnmatch(f.lower(), self.pattern.lower()))
+            except OSError as e:          # e.g. VPN down: keep the data we have, retry later
+                error, listing, names = str(e), None, None
             with self.lock:
-                epoch, folder = self.epoch, self.folder
-            now = time.time()
-            if now - self._last_scan >= self.SCAN_EVERY or not self.listing:
-                self._last_scan = now
-                error = None
-                try:
-                    names = self.fs.listdir(folder)
-                    listing = sorted(f for f in names if fnmatch.fnmatch(f.lower(), self.pattern.lower()))
-                except OSError as e:          # e.g. VPN down: keep the data we have, retry later
-                    error, listing, names = str(e), None, None
+                if epoch != self.epoch:   # folder changed meanwhile: start over at once
+                    return False
+                if error:
+                    if error != self.list_error:
+                        print(f"cannot list {folder}: {error}  (retrying)", flush=True)
+                    self.list_error = error
+                else:
+                    if self.list_error:
+                        print(f"folder reachable again ({len(listing)} report files)", flush=True)
+                    self.list_error = None
+                    self.listing = listing
+                    self.trn.update_listing(names)
+                    for name in listing:
+                        if name not in self.files:
+                            path = self.fs.join(folder, name)
+                            self.files[name] = ReportFile(path)
+                            self.readers[name] = FileReader(path, self.fs)
+        with self.lock:
+            todo = [] if self.list_error or epoch != self.epoch else \
+                [(n, self.readers[n], self.files[n]) for n in self.listing if n in self.readers]
+        for name, reader, rf in todo:
+            t0 = time.perf_counter()
+            events = reader.read()                    # file access outside the lock
+            if self.log:
+                self.log.slow(f"reading {name}", t0, 0.05)
+            if events:
                 with self.lock:
-                    if epoch != self.epoch:   # folder changed meanwhile
-                        continue
-                    if error:
-                        if error != self.list_error:
-                            print(f"cannot list {folder}: {error}  (retrying)", flush=True)
-                        self.list_error = error
-                    else:
-                        if self.list_error:
-                            print(f"folder reachable again ({len(listing)} report files)", flush=True)
-                        self.list_error = None
-                        self.listing = listing
-                        self.trn.update_listing(names)
-                        for name in listing:
-                            if name not in self.files:
-                                path = self.fs.join(folder, name)
-                                self.files[name] = ReportFile(path)
-                                self.readers[name] = FileReader(path, self.fs)
+                    if epoch != self.epoch:
+                        break
+                    rf.apply(events)
+        with self.lock:
+            trn = self.trn if epoch == self.epoch and not self.list_error else None
+        if trn is not None:
+            with self.lock:          # report definitions of the folder: not residuals
+                trn.report_names = {d.lower() for n in self.listing if n in self.files
+                                    for d in self.files[n].defs}
+            t0 = time.perf_counter()
+            results = trn.read()                       # transcripts: residuals + messages
+            if self.log:
+                self.log.slow("reading transcripts", t0, 0.05)
             with self.lock:
-                todo = [] if self.list_error or epoch != self.epoch else \
-                    [(n, self.readers[n], self.files[n]) for n in self.listing if n in self.readers]
-            for name, reader, rf in todo:
-                t0 = time.perf_counter()
-                events = reader.read()                    # file access outside the lock
-                if self.log:
-                    self.log.slow(f"reading {name}", t0, 0.05)
-                if events:
-                    with self.lock:
-                        if epoch != self.epoch:
-                            break
-                        rf.apply(events)
-            with self.lock:
-                trn = self.trn if epoch == self.epoch and not self.list_error else None
-            if trn is not None:
-                with self.lock:          # report definitions of the folder: not residuals
-                    trn.report_names = {d.lower() for n in self.listing if n in self.files
-                                        for d in self.files[n].defs}
-                t0 = time.perf_counter()
-                results = trn.read()                       # transcripts: residuals + messages
-                if self.log:
-                    self.log.slow("reading transcripts", t0, 0.05)
-                with self.lock:
-                    if epoch == self.epoch and results:
-                        trn.apply(results)
-                        sets = trn.datasets()
-                        self.virtual = [n for n, _ in sets]
-                        self.files.update(sets)
-            with self.lock:
-                if epoch == self.epoch:
-                    self.last_read = time.time()
-            self._wake.wait(self.interval)
-            self._wake.clear()
+                if epoch == self.epoch and results:
+                    trn.apply(results)
+                    sets = trn.datasets()
+                    self.virtual = [n for n, _ in sets]
+                    self.files.update(sets)
+        with self.lock:
+            if epoch == self.epoch:
+                self.last_read = time.time()
+        return True
 
     @staticmethod
     def _version(rf):
@@ -262,11 +285,15 @@ class Browser:
 
     def resolve(self, rel):
         parts = [p for p in str(rel or "").replace("\\", "/").split("/") if p not in ("", ".")]
-        if any(p == ".." or ":" in p for p in parts):
+        if any(p == ".." or ":" in p or "\x00" in p for p in parts):
             raise ValueError("invalid folder")
         path = self.root
         for p in parts:
             path = self.fs.join(path, p)
+        if not self.smb:          # a link / junction inside the root must not lead out of it
+            real, root = os.path.realpath(path), os.path.realpath(self.root)
+            if real != root and not real.startswith(root.rstrip(os.sep) + os.sep):
+                raise ValueError("this folder links to a place outside the allowed folders")
         return path
 
     def listing(self, rel):
@@ -292,6 +319,8 @@ def encode_rows(block):
 # --------------------------------------------------------------------------- HTTP side
 class Handler(BaseHTTPRequestHandler):
     server_version = "fluent-monitor"
+    sys_version = ""             # don't advertise the Python version
+    timeout = 20                 # seconds a client may stay silent before its connection is closed
     monitor: Monitor = None
     browser: Browser = None
     token = None
@@ -312,13 +341,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
         if gz:
             self.send_header("Content-Encoding", "gzip")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                pass                  # the browser gave up on this request (tab closed, reload, stopped page)
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj, separators=(",", ":"), allow_nan=False))
@@ -327,13 +361,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self.token:
             return True, None
         given = query.get("token", [None])[0]
-        if given == self.token:
+        if given is not None and hmac.compare_digest(given.encode(), self.token.encode()):
             return True, f"{COOKIE}={self.token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict"
         for part in self.headers.get("Cookie", "").split(";"):
             k, _, v = part.strip().partition("=")
-            if k == COOKIE and v == self.token:
+            if k == COOKIE and hmac.compare_digest(v.encode(), self.token.encode()):
                 return True, None
         return False, None
+
+    def _same_origin(self):
+        """Refuse requests a browser sends on behalf of another site (CSRF). Browsers send
+        Origin on POSTs; it must name this server."""
+        origin = self.headers.get("Origin")
+        if self.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
+            return False
+        if origin is None:
+            return True               # not a browser (e.g. curl with the token)
+        return urllib.parse.urlsplit(origin).netloc.lower() == self.headers.get("Host", "").lower()
 
     # ---- routes
     def do_GET(self):
@@ -341,7 +385,7 @@ class Handler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(url.query, keep_blank_values=True)
         ok, set_cookie = self._authorized(query)
         if not ok:
-            return self._send(403, "<h3>Access denied</h3><p>Open the link printed by fluent-monitor-web "
+            return self._send(403, "<h3>Access denied</h3><p>Open the link printed by fluent-monitor "
                                    "(it ends with <code>?token=...</code>) once in this browser.</p>",
                               "text/html; charset=utf-8")
         if set_cookie and url.path == "/":
@@ -374,15 +418,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urllib.parse.urlsplit(self.path)
         ok, _ = self._authorized(urllib.parse.parse_qs(url.query))
-        if not ok:
+        if not ok or not self._same_origin():
+            self.close_connection = True
             return self._json({"error": "access denied"}, 403)
+        if self.headers.get_content_type() != "application/json":
+            self.close_connection = True
+            return self._json({"error": "JSON expected"}, 415)
         try:
             n = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(min(n, 100000)) or b"{}")
+        except ValueError:
+            n = -1
+        if not 0 <= n <= MAX_BODY:
+            self.close_connection = True
+            return self._json({"error": "bad request size"}, 413 if n > MAX_BODY else 400)
+        try:
+            req = json.loads(self.rfile.read(n) or b"{}")
             if not isinstance(req, dict):
                 raise ValueError
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, UnicodeDecodeError, RecursionError):
+            # RecursionError: deeply nested JSON. Treat every parse failure as a bad request
+            # rather than letting it become an unhandled traceback.
             return self._json({"error": "bad request"}, 400)
+        except TimeoutError:              # announced more bytes than it sent
+            self.close_connection = True
+            return
         if url.path == "/api/folder":
             return self._set_folder(req.get("path"))
         if url.path == "/api/alerts/ack":
@@ -390,11 +449,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
         if url.path != "/api/groups":
             return self._json({"error": "not found"}, 404)
-        try:
-            name = str(req.get("name", "")).strip()[:120]
-            files = [str(f) for f in req.get("files", [])][:50]
-        except (ValueError, TypeError):
+        name, files = req.get("name", ""), req.get("files", [])
+        if not isinstance(name, str) or not isinstance(files, list) or not all(isinstance(f, str) for f in files):
             return self._json({"error": "bad request"}, 400)
+        name, files = name.strip()[:120], files[:50]
         if not name:
             return self._json({"error": "name missing"}, 400)
         known = set(self.monitor.listing) | set(self.monitor.virtual)
@@ -440,16 +498,63 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"folder": path, "epoch": self.monitor.epoch})
 
     def _static(self, rel):
-        rel = os.path.normpath(rel).replace("\\", "/")
-        if rel.startswith("..") or rel.startswith("/"):
+        # only the files shipped in web_static, by exact name (no paths: on Windows a request for
+        # /static/C:/... would otherwise reach any drive)
+        ext = os.path.splitext(rel)[1].lower()
+        if rel not in STATIC_FILES or ext not in STATIC_TYPES:
             return self._send(404, "not found", "text/plain")
         path = os.path.join(STATIC_DIR, rel)
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in STATIC_TYPES or not os.path.isfile(path):
-            return self._send(404, "not found", "text/plain")
         with open(path, "rb") as fh:
             body = fh.read()
         return self._send(200, body, STATIC_TYPES[ext])
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    _slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+    _per_ip = {}                       # client ip -> open connections from it
+    _per_ip_lock = threading.Lock()
+
+    def process_request(self, request, client_address):
+        """At most MAX_CONNECTIONS connections at once, and at most MAX_PER_IP from any single
+        address. A connection that never finishes its request (slowloris) only holds a slot until
+        `timeout`; capping per address keeps one remote host from grabbing them all meanwhile."""
+        ip = client_address[0] if client_address else ""
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        with self._per_ip_lock:
+            if self._per_ip.get(ip, 0) >= MAX_PER_IP:
+                self._slots.release()
+                self.shutdown_request(request)
+                return
+            self._per_ip[ip] = self._per_ip.get(ip, 0) + 1
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._release(ip)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release(client_address[0] if client_address else "")
+
+    def _release(self, ip):
+        with self._per_ip_lock:
+            left = self._per_ip.get(ip, 0) - 1
+            if left > 0:
+                self._per_ip[ip] = left
+            else:
+                self._per_ip.pop(ip, None)
+        self._slots.release()
+
+    def handle_error(self, request, client_address):
+        """Browsers drop connections all the time (reload, closed tab): no traceback for those."""
+        if isinstance(sys.exc_info()[1], (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def local_addresses():
@@ -533,26 +638,38 @@ def main():
     # > last folder > root
     folder = next((f for f in (args.folder, saved if usable(saved) else None, env_folder,
                                None if smb else load_last_folder(), base, browser.root) if f and is_smb_path(f) == smb))
+    fallback = False
     if smb:
         folder = normalize(folder)
     else:
         if os.path.isfile(folder):
             folder = os.path.dirname(folder)
         folder = os.path.abspath(folder)
-        if not os.path.isdir(folder):
-            sys.exit(f"Folder not found: {folder}")
-        save_last_folder(folder)
-    if browser.rel(folder) is not None:
+        if not os.path.isdir(folder):        # renamed, moved or a drive that isn't connected
+            missing, folder, fallback = folder, existing_parent(folder), True
+            print(f"note: {missing} doesn't exist (any more); starting in {folder} instead. "
+                  f"Choose the case with \"Change folder…\" in the page.", flush=True)
+            if not args.root and browser.rel(folder) is None:   # e.g. the whole drive is gone
+                browser = Browser(fs, os.path.splitdrive(folder)[0] + os.sep, smb, args.pattern)
+        if not fallback:              # keep remembering the real case (e.g. a drive connected later)
+            save_last_folder(folder)
+    if fallback:
+        pass
+    elif browser.rel(folder) is not None:
         save_web_folder(folder)       # appears under "Recent" in the folder dialog
     else:
         print(f"warning: {folder} is outside {browser.root}; the web page can only switch to folders "
               f"inside {browser.root}", flush=True)
 
+    home = os.path.expanduser("~")
+    if not os.access(home, os.W_OK):
+        print(f"warning: cannot write to {home}: the access token and settings are not kept between starts "
+              f"(in Docker: chown 99:100 the data folder)", flush=True)
     token = None if args.no_token else get_web_token(renew=args.new_token)
     q = f"/?token={token}" if token else "/"
     local_url = f"http://localhost:{args.port}{q}"
     try:
-        httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
+        httpd = Server((args.bind, args.port), Handler)
     except OSError as e:
         if _already_running(args.port):
             print(f"fluent-monitor is already running on port {args.port}; opening it in the browser.")
@@ -592,6 +709,18 @@ def main():
     except KeyboardInterrupt:
         print("stopped")
     sys.stdout.flush()
+
+
+def existing_parent(path):
+    """The nearest folder above `path` that exists, else the home folder."""
+    p = os.path.abspath(path)
+    while True:
+        parent = os.path.dirname(p)
+        if os.path.isdir(parent):
+            return parent
+        if parent == p:
+            return os.path.expanduser("~")
+        p = parent
 
 
 def _already_running(port):

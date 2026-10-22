@@ -79,6 +79,25 @@ function tickValues(u, splits, ai) {      // plain numbers, never an offset; exp
   return splits.map(v => { const s = v.toFixed(dec); return /^-0(\.0*)?$/.test(s) ? s.slice(1) : s; });
 }
 
+// Ticks of a log axis. uPlot's own log splits (1.6.32) can loop until the browser gives up when
+// the axis minimum lies just below a power of ten (e.g. 0.00096): Firefox then reports the page as
+// slowing it down. These are computed directly: 1..9 x 10^k inside [min, max], fewer for wide ranges.
+function logSplits(u, ai, min, max) {
+  if (!(min > 0) || !(max > min) || !isFinite(min) || !isFinite(max)) return [];
+  const lo = Math.floor(Math.log10(min)), hi = Math.ceil(Math.log10(max));
+  const decades = hi - lo;
+  const step = Math.max(1, Math.ceil(decades / 30));          // at most ~30 decades with ticks
+  const mults = decades <= 12 ? [1, 2, 3, 4, 5, 6, 7, 8, 9] : [1];
+  const out = [];
+  for (let k = lo; k <= hi; k += step) {
+    for (const m of mults) {
+      const v = +(m * 10 ** k).toPrecision(12);
+      if (v >= min && v <= max) out.push(v);
+    }
+  }
+  return out;
+}
+
 function axisSize(u, values, ai, cycle) {  // width of the y axis from its widest tick label
   const axis = u.axes[ai];
   if (cycle > 1) return axis._size;
@@ -372,7 +391,8 @@ class Plot {
         Object.assign({}, axisCommon, {label: this.compact ? null : xname, labelSize: this.compact ? 0 : 20,
                                        space: this.compact ? 60 : 70, size: fs + 14}),
         Object.assign({}, axisCommon, {label: (!this.compact && only) ? only : null,
-                                       labelSize: (!this.compact && only) ? 20 : 0, space: 32, size: axisSize}),
+                                       labelSize: (!this.compact && only) ? 20 : 0, space: 32, size: axisSize},
+                      p.logy ? {splits: logSplits} : {}),
       ],
       series: [{}].concat(meta.map(m => ({
         label: m.label, stroke: m.color, width: 1.25, dash: m.dash || undefined,
@@ -440,7 +460,7 @@ class Plot {
     }
     if (lo > hi) return null;
     if (log) {
-      let a = Math.log10(lo), b = Math.log10(hi);
+      let a = Math.max(-300, Math.log10(lo)), b = Math.min(300, Math.log10(hi));   // no under/overflow
       if (b - a < 1e-9) { a -= 0.5; b += 0.5; }
       const pad = (b - a) * 0.05;
       return [10 ** (a - pad), 10 ** (b + pad)];
@@ -459,7 +479,7 @@ class Plot {
     if (!xr) return;
     let [a, b] = xr;
     if (b - a <= 0) { a -= 1; b += 1; } else { const pad = (b - a) * 0.02; a -= pad; b += pad; }
-    const yr = this.yRange(xr) || [0, 1];
+    const yr = this.yRange(xr) || (per(this.key).logy ? [0.1, 10] : [0, 1]);   // nothing to show (e.g. log of negatives)
     this.applyRange([a, b], yr);
     this.vs.x = null; this.vs.y = null;
   }
@@ -523,6 +543,7 @@ class Plot {
                         : [u.posToVal(px - px * fx, "x"), u.posToVal(px + (W - px) * fx, "x")];
     const yr = fy === 1 ? [u.scales.y.min, u.scales.y.max]
                         : [u.posToVal(py + (H - py) * fy, "y"), u.posToVal(py - py * fy, "y")];
+    if (per(this.key).logy) { yr[0] = Math.max(yr[0], 1e-300); yr[1] = Math.min(yr[1], 1e300); }   // stay in range
     if (!(xr[1] > xr[0]) || !(yr[1] > yr[0])) return;
     this.userRange(xr, yr);
     if (this.tip) this.hideTip();
@@ -703,7 +724,6 @@ class Plot {
       this.buildLegend();
       if (this.vs.follow) this.fit();
     }}, "show all");
-    this.legendEl.append(this.showAll);
     this.meta.forEach((m, i) => {
       const sw = document.createElementNS("http://www.w3.org/2000/svg", "svg");
       sw.setAttribute("width", "22"); sw.setAttribute("height", "8");
@@ -728,6 +748,7 @@ class Plot {
       });
       this.legendEl.append(item);
     });
+    this.legendEl.append(this.showAll);       // at the end, so the entries above never move
   }
 
   updateStatus() {

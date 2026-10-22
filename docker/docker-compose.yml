@@ -34,8 +34,13 @@ services:
         condition: service_started
         restart: true                 # restart together with the tunnel (it loses its network otherwise)
     env_file: .env                    # FLUENT_FOLDER, SMB_USERNAME, SMB_PASSWORD, ...
+    # hardening: no Linux capabilities, no privilege gain, read-only system files
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
     environment:
       - TZ=${TZ:-Europe/Berlin}
     volumes:
-      - ./data:/data                  # access token + combined plots survive updates
+      - ./data:/data                  # access token + combined plots survive updates (owned by 99:100)
     restart: unless-stopped
